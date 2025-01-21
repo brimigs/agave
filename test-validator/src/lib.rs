@@ -872,6 +872,11 @@ impl TestValidator {
             genesis_utils::activate_feature(&mut genesis_config, feature);
         }
 
+        if let Some(warp_slot) = config.warp_slot {
+            info!("Warping ledger to slot: {}", warp_slot);
+            genesis_config.poh_config.target_tick_count = Option::from(warp_slot * genesis_config.ticks_per_slot);
+        }
+
         let ledger_path = match &config.ledger_path {
             None => create_new_tmp_ledger!(&genesis_config).0,
             Some(ledger_path) => {
@@ -1303,5 +1308,38 @@ mod test {
         assert_eq!(feature_account.owner, solana_sdk::feature::id());
         let feature_state: Feature = bincode::deserialize(feature_account.data()).unwrap();
         assert!(feature_state.activated_at.is_some());
+    }
+
+    /// Test that the warp_slot configuration works and the validator starts at the correct slot
+    #[test]
+    fn test_warp_slot_success() {
+        // Define the warp slot
+        let desired_warp_slot: Slot = 100;
+
+        // Configure the TestValidatorGenesis
+        let mut genesis_config = TestValidatorGenesis::default();
+        genesis_config.warp_slot(desired_warp_slot); // Set the warp slot
+        genesis_config.rpc_port(8899); // Ensure RPC is accessible for validation
+
+        // Start the TestValidator
+        let (test_validator, _mint_keypair) = genesis_config
+            .start_with_socket_addr_space(SocketAddrSpace::new(/*allow_private_addr=*/ true));
+
+        // Create an RPC client to interact with the validator
+        let rpc_url = &test_validator.rpc_url;
+        let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::processed());
+
+        // Fetch the current slot from the validator
+        let current_slot = rpc_client
+            .get_slot()
+            .expect("Failed to get slot from TestValidator");
+
+        // Assert that the validator's current slot matches or exceeds the desired warp slot
+        assert!(
+            current_slot >= desired_warp_slot,
+            "Validator did not warp to the desired slot. Expected at least {}, got {}",
+            desired_warp_slot,
+            current_slot
+        );
     }
 }
