@@ -131,6 +131,8 @@ use {
     },
     solana_streamer::socket::SocketAddrSpace,
 };
+use solana_accounts_db::epoch_accounts_hash::EpochAccountsHash;
+use solana_runtime::accounts_background_service::{AbsRequestSender, SnapshotRequestKind};
 
 pub mod account_resolver;
 
@@ -266,6 +268,70 @@ impl JsonRpcRequestProcessor {
 }
 
 impl JsonRpcRequestProcessor {
+
+    pub fn warp_slot(&self, target_slot: u64) -> Result<()> {
+        let mut bank_forks = self.bank_forks.write().unwrap();
+        let bank = bank_forks.working_bank();
+
+        bank.fill_bank_with_ticks_for_tests();
+
+        // Ensure that we are actually progressing forward
+        let working_slot = bank.slot();
+
+        let pre_warp_slot = target_slot - 1;
+        let warp_bank = if pre_warp_slot == working_slot {
+            bank.freeze();
+            bank
+        } else {
+            bank_forks
+                .insert(Bank::warp_from_parent(
+                    bank,
+                    &Pubkey::default(),
+                    pre_warp_slot,
+                    solana_accounts_db::accounts_db::CalcAccountsHashDataSource::IndexForTests,
+                ))
+                .clone_without_scheduler()
+        };
+
+        let (snapshot_request_sender, snapshot_request_receiver) = crossbeam_channel::unbounded();
+        let abs_request_sender = AbsRequestSender::new(snapshot_request_sender);
+
+        bank_forks
+            .set_root(pre_warp_slot, &abs_request_sender, Some(pre_warp_slot))
+            .unwrap();
+
+        snapshot_request_receiver
+            .try_iter()
+            .filter(|snapshot_request| {
+                snapshot_request.request_kind == SnapshotRequestKind::EpochAccountsHash
+            })
+            .for_each(|snapshot_request| {
+                snapshot_request
+                    .snapshot_root_bank
+                    .rc
+                    .accounts
+                    .accounts_db
+                    .epoch_accounts_hash_manager
+                    .set_valid(
+                        EpochAccountsHash::new(Hash::new_unique()),
+                        snapshot_request.snapshot_root_bank.slot(),
+                    )
+            });
+
+        bank_forks.insert(Bank::new_from_parent(
+            warp_bank,
+            &Pubkey::default(),
+            target_slot,
+        ));
+
+        let mut w_block_commitment_cache = self.block_commitment_cache.write().unwrap();
+
+        w_block_commitment_cache.set_all_slots(target_slot, target_slot);
+
+        let bank = bank_forks.working_bank();
+
+        Ok(())
+    }
     fn get_bank_with_config(&self, config: RpcContextConfig) -> Result<Arc<Bank>> {
         let RpcContextConfig {
             commitment,

@@ -42,6 +42,8 @@ pub enum RpcCustomError {
     },
     #[error("TransactionSignatureVerificationFailure")]
     TransactionSignatureVerificationFailure,
+    #[error("TargetSlotIsBehindCurrentSlot")]
+    TargetSlotIsBehindCurrentSlot,
     #[error("BlockNotAvailable")]
     BlockNotAvailable { slot: Slot },
     #[error("NodeUnhealthy")]
