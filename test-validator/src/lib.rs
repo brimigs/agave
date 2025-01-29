@@ -100,7 +100,7 @@ impl Default for TestValidatorNodeConfig {
     fn default() -> Self {
         const MIN_PORT_RANGE: u16 = 1024;
         const MAX_PORT_RANGE: u16 = 65535;
-
+ 
         let bind_ip_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let port_range = (MIN_PORT_RANGE, MAX_PORT_RANGE);
 
@@ -1177,6 +1177,22 @@ impl TestValidator {
     pub fn repair_whitelist(&self) -> Arc<RwLock<HashSet<Pubkey>>> {
         Arc::new(RwLock::new(HashSet::default()))
     }
+
+    // /// Warp the bank to a specified slot
+    // fn warp_to_slot(bank_forks: &Arc<RwLock<BankForks>>, slot: u64) {
+    //     let mut w_bank_forks = bank_forks.write().unwrap();
+    //     let bank = w_bank_forks.working_bank();
+    //     let frozen_bank = bank.clone();
+
+    //     while frozen_bank.slot() < slot {
+    //         let new_bank = Arc::new(Bank::new_from_parent(
+    //             &frozen_bank,
+    //             &frozen_bank.collector_id(),
+    //             frozen_bank.slot() + 1,
+    //         ));
+    //         w_bank_forks.insert(new_bank);
+    //     }
+    // }
 }
 
 impl Drop for TestValidator {
