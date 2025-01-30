@@ -597,17 +597,17 @@ mod test {
     use {
         super::*,
         bytemuck::Zeroable,
-        solana_sdk::{
-            instruction::{AccountMeta, Instruction},
-            pubkey::Pubkey,
-        },
+        solana_instruction::{AccountMeta, Instruction},
+        solana_pubkey::Pubkey,
         spl_token_2022::{
             extension::confidential_transfer::instruction::{
                 initialize_mint, inner_configure_account, inner_empty_account, update_mint,
             },
             solana_program::message::Message,
             solana_zk_sdk::{
-                encryption::pod::auth_encryption::PodAeCiphertext,
+                encryption::pod::{
+                    auth_encryption::PodAeCiphertext, elgamal::PodElGamalCiphertext,
+                },
                 zk_elgamal_proof_program::proof_data::{
                     BatchedGroupedCiphertext3HandlesValidityProofData, BatchedRangeProofU128Data,
                     CiphertextCommitmentEqualityProofData, ZeroCiphertextProofData,
@@ -688,7 +688,7 @@ mod test {
                 &spl_token_2022::id(),
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
-                PodAeCiphertext::default(),
+                &PodAeCiphertext::default(),
                 10_000,
                 &Pubkey::new_unique(),
                 &[],
@@ -758,7 +758,7 @@ mod test {
                 &Pubkey::new_unique(),
                 1,
                 2,
-                PodAeCiphertext::default(),
+                &PodAeCiphertext::default(),
                 &Pubkey::new_unique(),
                 &[],
                 equality_proof_location,
@@ -813,7 +813,9 @@ mod test {
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
-                PodAeCiphertext::default(),
+                &PodAeCiphertext::default(),
+                &PodElGamalCiphertext::default(),
+                &PodElGamalCiphertext::default(),
                 &Pubkey::new_unique(),
                 &[],
                 equality_proof_location,
@@ -895,7 +897,9 @@ mod test {
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
-                PodAeCiphertext::default(),
+                &PodAeCiphertext::default(),
+                &PodElGamalCiphertext::default(),
+                &PodElGamalCiphertext::default(),
                 &Pubkey::new_unique(),
                 &[],
                 equality_proof_location,

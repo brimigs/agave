@@ -6,7 +6,7 @@ use {
     solana_feature_set as feature_set,
     solana_gossip::{
         cluster_info::ClusterInfo,
-        contact_info::{ContactInfo, Protocol},
+        contact_info::{ContactInfo as GossipContactInfo, Protocol},
         crds::GossipRoute,
         crds_data::CrdsData,
         crds_gossip_pull::CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
@@ -30,8 +30,8 @@ use {
         collections::{HashMap, HashSet},
         iter::repeat_with,
         marker::PhantomData,
-        net::{IpAddr, SocketAddr},
-        sync::{Arc, RwLock},
+        net::SocketAddr,
+        sync::{Arc, OnceLock, RwLock},
         time::{Duration, Instant},
     },
     thiserror::Error,
@@ -58,6 +58,16 @@ enum NodeId {
     Pubkey(Pubkey),
 }
 
+// A lite version of gossip ContactInfo local to turbine where we only hold on
+// to a few necessary fields from gossip ContactInfo.
+#[derive(Clone, Debug)]
+pub(crate) struct ContactInfo {
+    pubkey: Pubkey,
+    wallclock: u64,
+    tvu_quic: Option<SocketAddr>,
+    tvu_udp: Option<SocketAddr>,
+}
+
 pub struct Node {
     node: NodeId,
     stake: u64,
@@ -74,12 +84,13 @@ pub struct ClusterNodes<T> {
     _phantom: PhantomData<T>,
 }
 
-type CacheEntry<T> = Option<(/*as of:*/ Instant, Arc<ClusterNodes<T>>)>;
+// Cache entries are wrapped in Arc<OnceLock<...>>, so that, when needed, only
+// one single thread initializes the entry for the epoch without holding a lock
+// on the entire cache.
+type LruCacheOnce<K, V> = RwLock<LruCache<K, Arc<OnceLock<V>>>>;
 
 pub struct ClusterNodesCache<T> {
-    // Cache entries are wrapped in Arc<RwLock<...>>, so that, when needed, only
-    // one thread does the computations to update the entry for the epoch.
-    cache: RwLock<LruCache<Epoch, Arc<RwLock<CacheEntry<T>>>>>,
+    cache: LruCacheOnce<Epoch, (/*as of:*/ Instant, Arc<ClusterNodes<T>>)>,
     ttl: Duration, // Time to live.
 }
 
@@ -97,6 +108,48 @@ impl Node {
         match &self.node {
             NodeId::Pubkey(_) => None,
             NodeId::ContactInfo(node) => Some(node),
+        }
+    }
+
+    #[inline]
+    fn contact_info_mut(&mut self) -> Option<&mut ContactInfo> {
+        match &mut self.node {
+            NodeId::Pubkey(_) => None,
+            NodeId::ContactInfo(node) => Some(node),
+        }
+    }
+}
+
+impl ContactInfo {
+    #[inline]
+    pub(crate) fn pubkey(&self) -> &Pubkey {
+        &self.pubkey
+    }
+
+    #[inline]
+    pub(crate) fn wallclock(&self) -> u64 {
+        self.wallclock
+    }
+
+    #[inline]
+    pub(crate) fn tvu(&self, protocol: Protocol) -> Option<SocketAddr> {
+        match protocol {
+            Protocol::QUIC => self.tvu_quic,
+            Protocol::UDP => self.tvu_udp,
+        }
+    }
+
+    // Removes respective TVU address from the ContactInfo so that no more
+    // shreds are sent to that socket address.
+    #[inline]
+    fn remove_tvu_addr(&mut self, protocol: Protocol) {
+        match protocol {
+            Protocol::QUIC => {
+                self.tvu_quic = None;
+            }
+            Protocol::UDP => {
+                self.tvu_udp = None;
+            }
         }
     }
 }
@@ -179,25 +232,14 @@ impl ClusterNodes<RetransmitStage> {
             weighted_shuffle.remove_index(*index);
         }
         let mut rng = get_seeded_rng(slot_leader, shred);
-        let nodes = {
-            let protocol = get_broadcast_protocol(shred);
-            // If there are 2 nodes in the shuffle with the same socket-addr,
-            // we only send shreds to the first one. The hash-set below allows
-            // to track if a socket-addr was observed earlier in the shuffle.
-            let mut addrs = HashSet::<SocketAddr>::with_capacity(self.nodes.len());
-            weighted_shuffle.shuffle(&mut rng).map(move |index| {
-                let node = &self.nodes[index];
-                let addr: Option<SocketAddr> = node
-                    .contact_info()
-                    .and_then(|node| node.tvu(protocol))
-                    .filter(|&addr| addrs.insert(addr));
-                (node, addr)
-            })
-        };
-        let (index, peers) =
-            get_retransmit_peers(fanout, |(node, _)| node.pubkey() == &self.pubkey, nodes);
+        let (index, peers) = get_retransmit_peers(
+            fanout,
+            |k| self.nodes[k].pubkey() == &self.pubkey,
+            weighted_shuffle.shuffle(&mut rng),
+        );
+        let protocol = get_broadcast_protocol(shred);
         let peers = peers
-            .filter_map(|(_, addr)| addr)
+            .filter_map(|k| self.nodes[k].contact_info()?.tvu(protocol))
             .filter(|addr| socket_addr_space.check(addr))
             .collect();
         let root_distance = get_root_distance(index, fanout);
@@ -276,27 +318,28 @@ fn get_nodes(
     stakes: &HashMap<Pubkey, u64>,
 ) -> Vec<Node> {
     let self_pubkey = cluster_info.id();
-    let should_dedup_addrs = match cluster_type {
+    let should_dedup_tvu_addrs = match cluster_type {
         ClusterType::Development => false,
         ClusterType::Devnet | ClusterType::Testnet | ClusterType::MainnetBeta => true,
-    };
-    // Maps IP addresses to number of nodes at that IP address.
-    let mut counts = {
-        let capacity = if should_dedup_addrs { stakes.len() } else { 0 };
-        HashMap::<IpAddr, usize>::with_capacity(capacity)
     };
     let mut nodes: Vec<Node> = std::iter::once({
         // The local node itself.
         let stake = stakes.get(&self_pubkey).copied().unwrap_or_default();
-        let node = NodeId::from(cluster_info.my_contact_info());
+        let node = ContactInfo::from(&cluster_info.my_contact_info());
+        let node = NodeId::from(node);
         Node { node, stake }
     })
     // All known tvu-peers from gossip.
-    .chain(cluster_info.tvu_peers().into_iter().map(|node| {
-        let stake = stakes.get(node.pubkey()).copied().unwrap_or_default();
-        let node = NodeId::from(node);
-        Node { node, stake }
-    }))
+    .chain(
+        cluster_info
+            .tvu_peers(|node| ContactInfo::from(node))
+            .into_iter()
+            .map(|node| {
+                let stake = stakes.get(node.pubkey()).copied().unwrap_or_default();
+                let node = NodeId::from(node);
+                Node { node, stake }
+            }),
+    )
     // All staked nodes.
     .chain(
         stakes
@@ -309,33 +352,9 @@ fn get_nodes(
     )
     .collect();
     sort_and_dedup_nodes(&mut nodes);
-    nodes.retain_mut(|node| {
-        if !should_dedup_addrs
-            || node
-                .contact_info()
-                .and_then(|node| node.tvu(Protocol::UDP))
-                .map(|addr| {
-                    *counts
-                        .entry(addr.ip())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1)
-                })
-                <= Some(MAX_NUM_NODES_PER_IP_ADDRESS)
-        {
-            true
-        } else if node.stake > 0u64 {
-            // Staked node: keep the pubkey for deterministic shuffle, but
-            // strip the contact-info so that no more packets are sent to this
-            // IP address.
-            *node = Node {
-                node: NodeId::from(*node.pubkey()),
-                stake: node.stake,
-            };
-            true
-        } else {
-            false // Non-staked node: drop it entirely.
-        }
-    });
+    if should_dedup_tvu_addrs {
+        dedup_tvu_addrs(&mut nodes);
+    };
     nodes
 }
 
@@ -361,6 +380,48 @@ fn cmp_nodes_stake(a: &Node, b: &Node) -> Ordering {
             (NodeId::Pubkey(_), NodeId::ContactInfo(_)) => Ordering::Less,
             (NodeId::Pubkey(_), NodeId::Pubkey(_)) => Ordering::Equal,
         })
+}
+
+// Dedups socket addresses so that if there are 2 nodes in the cluster with the
+// same TVU socket-addr, we only send shreds to one of them.
+// Additionally limits number of nodes at the same IP address to
+// MAX_NUM_NODES_PER_IP_ADDRESS.
+fn dedup_tvu_addrs(nodes: &mut Vec<Node>) {
+    const TVU_PROTOCOLS: [Protocol; 2] = [Protocol::UDP, Protocol::QUIC];
+    let capacity = nodes.len().saturating_mul(2);
+    // Tracks (Protocol, SocketAddr) tuples already observed.
+    let mut addrs = HashSet::with_capacity(capacity);
+    // Maps IP addresses to number of nodes at that IP address.
+    let mut counts = HashMap::with_capacity(capacity);
+    nodes.retain_mut(|node| {
+        let node_stake = node.stake;
+        let Some(node) = node.contact_info_mut() else {
+            // Need to keep staked identities without gossip ContactInfo for
+            // deterministic shuffle.
+            return node_stake > 0u64;
+        };
+        // Dedup socket addresses and limit nodes at same IP address.
+        for protocol in TVU_PROTOCOLS {
+            let Some(addr) = node.tvu(protocol) else {
+                continue;
+            };
+            let count: usize = *counts
+                .entry((protocol, addr.ip()))
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            if !addrs.insert((protocol, addr)) || count > MAX_NUM_NODES_PER_IP_ADDRESS {
+                // Remove the respective TVU address so that no more shreds are
+                // sent to this socket address.
+                node.remove_tvu_addr(protocol);
+            }
+        }
+        // Always keep staked nodes for deterministic shuffle,
+        // but drop non-staked nodes if they have no valid TVU address.
+        node_stake > 0u64
+            || TVU_PROTOCOLS
+                .into_iter()
+                .any(|protocol| node.tvu(protocol).is_some())
+    })
 }
 
 fn get_seeded_rng(leader: &Pubkey, shred: &ShredId) -> ChaChaRng {
@@ -437,22 +498,6 @@ impl<T> ClusterNodesCache<T> {
 }
 
 impl<T: 'static> ClusterNodesCache<T> {
-    fn get_cache_entry(&self, epoch: Epoch) -> Arc<RwLock<CacheEntry<T>>> {
-        if let Some(entry) = self.cache.read().unwrap().get(&epoch) {
-            return Arc::clone(entry);
-        }
-        let mut cache = self.cache.write().unwrap();
-        // Have to recheck again here because the cache might have been updated
-        // by another thread in between the time this thread releases the read
-        // lock and obtains the write lock.
-        if let Some(entry) = cache.get(&epoch) {
-            return Arc::clone(entry);
-        }
-        let entry = Arc::default();
-        cache.put(epoch, Arc::clone(&entry));
-        entry
-    }
-
     pub(crate) fn get(
         &self,
         shred_slot: Slot,
@@ -460,52 +505,79 @@ impl<T: 'static> ClusterNodesCache<T> {
         working_bank: &Bank,
         cluster_info: &ClusterInfo,
     ) -> Arc<ClusterNodes<T>> {
+        // Returns the cached entry for the epoch if it is either uninitialized
+        // or not expired yet. Discards the entry if it is already initialized
+        // but also expired.
+        let get_epoch_entry = |cache: &LruCache<Epoch, _>, epoch, ttl| {
+            let entry: &Arc<OnceLock<(Instant, _)>> = cache.get(&epoch)?;
+            let Some((asof, _)) = entry.get() else {
+                return Some(entry.clone()); // not initialized yet
+            };
+            (asof.elapsed() < ttl).then(|| entry.clone())
+        };
         let epoch_schedule = root_bank.epoch_schedule();
         let epoch = epoch_schedule.get_epoch(shred_slot);
-        let entry = self.get_cache_entry(epoch);
-        if let Some((_, nodes)) = entry
-            .read()
-            .unwrap()
-            .as_ref()
-            .filter(|(asof, _)| asof.elapsed() < self.ttl)
-        {
-            return nodes.clone();
-        }
-        // Hold the lock on the entry here so that, if needed, only
-        // one thread recomputes cluster-nodes for this epoch.
-        let mut entry = entry.write().unwrap();
-        if let Some((_, nodes)) = entry.as_ref().filter(|(asof, _)| asof.elapsed() < self.ttl) {
-            return nodes.clone();
-        }
-        let epoch_staked_nodes = [root_bank, working_bank]
-            .iter()
-            .find_map(|bank| bank.epoch_staked_nodes(epoch));
-        if epoch_staked_nodes.is_none() {
-            inc_new_counter_info!("cluster_nodes-unknown_epoch_staked_nodes", 1);
-            if epoch != epoch_schedule.get_epoch(root_bank.slot()) {
-                return self.get(root_bank.slot(), root_bank, working_bank, cluster_info);
-            }
-            inc_new_counter_info!("cluster_nodes-unknown_epoch_staked_nodes_root", 1);
-        }
-        let nodes = Arc::new(new_cluster_nodes::<T>(
-            cluster_info,
-            root_bank.cluster_type(),
-            &epoch_staked_nodes.unwrap_or_default(),
-        ));
-        *entry = Some((Instant::now(), Arc::clone(&nodes)));
-        nodes
+        // Read from the cache with a shared lock.
+        let entry = {
+            let cache = self.cache.read().unwrap();
+            get_epoch_entry(&cache, epoch, self.ttl)
+        };
+        // Fall back to exclusive lock if there is a cache miss or the cached
+        // entry has already expired.
+        let entry: Arc<OnceLock<_>> = entry.unwrap_or_else(|| {
+            let mut cache = self.cache.write().unwrap();
+            get_epoch_entry(&cache, epoch, self.ttl).unwrap_or_else(|| {
+                // Either a cache miss here or the existing entry has already
+                // expired. Upsert and return an uninitialized entry.
+                let entry = Arc::<OnceLock<_>>::default();
+                cache.put(epoch, Arc::clone(&entry));
+                entry
+            })
+        });
+        // Initialize if needed by only a single thread outside locks.
+        let (_, nodes) = entry.get_or_init(|| {
+            let epoch_staked_nodes = [root_bank, working_bank]
+                .iter()
+                .find_map(|bank| bank.epoch_staked_nodes(epoch))
+                .unwrap_or_else(|| {
+                    error!(
+                        "ClusterNodesCache::get: unknown Bank::epoch_staked_nodes \
+                    for epoch: {epoch}, slot: {shred_slot}"
+                    );
+                    inc_new_counter_error!("cluster_nodes-unknown_epoch_staked_nodes", 1);
+                    Arc::<HashMap<Pubkey, /*stake:*/ u64>>::default()
+                });
+            let nodes =
+                new_cluster_nodes::<T>(cluster_info, root_bank.cluster_type(), &epoch_staked_nodes);
+            (Instant::now(), Arc::new(nodes))
+        });
+        nodes.clone()
     }
 }
 
 impl From<ContactInfo> for NodeId {
+    #[inline]
     fn from(node: ContactInfo) -> Self {
         NodeId::ContactInfo(node)
     }
 }
 
 impl From<Pubkey> for NodeId {
+    #[inline]
     fn from(pubkey: Pubkey) -> Self {
         NodeId::Pubkey(pubkey)
+    }
+}
+
+impl From<&GossipContactInfo> for ContactInfo {
+    #[inline]
+    fn from(node: &GossipContactInfo) -> Self {
+        Self {
+            pubkey: *node.pubkey(),
+            wallclock: node.wallclock(),
+            tvu_quic: node.tvu(Protocol::QUIC),
+            tvu_udp: node.tvu(Protocol::UDP),
+        }
     }
 }
 
@@ -532,20 +604,20 @@ pub fn make_test_cluster<R: Rng>(
     num_nodes: usize,
     unstaked_ratio: Option<(u32, u32)>,
 ) -> (
-    Vec<ContactInfo>,
+    Vec<GossipContactInfo>,
     HashMap<Pubkey, u64>, // stakes
     ClusterInfo,
 ) {
     let (unstaked_numerator, unstaked_denominator) = unstaked_ratio.unwrap_or((1, 7));
     let mut nodes: Vec<_> = repeat_with(|| {
         let pubkey = solana_sdk::pubkey::new_rand();
-        ContactInfo::new_localhost(&pubkey, /*wallclock:*/ timestamp())
+        GossipContactInfo::new_localhost(&pubkey, /*wallclock:*/ timestamp())
     })
     .take(num_nodes)
     .collect();
     nodes.shuffle(rng);
     let keypair = Arc::new(Keypair::new());
-    nodes[0] = ContactInfo::new_localhost(&keypair.pubkey(), /*wallclock:*/ timestamp());
+    nodes[0] = GossipContactInfo::new_localhost(&keypair.pubkey(), /*wallclock:*/ timestamp());
     let this_node = nodes[0].clone();
     let mut stakes: HashMap<Pubkey, u64> = nodes
         .iter()
@@ -566,7 +638,7 @@ pub fn make_test_cluster<R: Rng>(
         let mut gossip_crds = cluster_info.gossip.crds.write().unwrap();
         // First node is pushed to crds table by ClusterInfo constructor.
         for node in nodes.iter().skip(1) {
-            let node = CrdsData::ContactInfo(node.clone());
+            let node = CrdsData::from(node);
             let node = CrdsValue::new(node, &keypair);
             assert_eq!(
                 gossip_crds.insert(node, now, GossipRoute::LocalMessage),
@@ -644,7 +716,10 @@ mod tests {
         let mut rng = rand::thread_rng();
         let (nodes, stakes, cluster_info) = make_test_cluster(&mut rng, 1_000, None);
         // ClusterInfo::tvu_peers excludes the node itself.
-        assert_eq!(cluster_info.tvu_peers().len(), nodes.len() - 1);
+        assert_eq!(
+            cluster_info.tvu_peers(GossipContactInfo::clone).len(),
+            nodes.len() - 1
+        );
         let cluster_nodes =
             new_cluster_nodes::<RetransmitStage>(&cluster_info, ClusterType::Development, &stakes);
         // All nodes with contact-info should be in the index.
@@ -680,7 +755,10 @@ mod tests {
         let mut rng = rand::thread_rng();
         let (nodes, stakes, cluster_info) = make_test_cluster(&mut rng, 1_000, None);
         // ClusterInfo::tvu_peers excludes the node itself.
-        assert_eq!(cluster_info.tvu_peers().len(), nodes.len() - 1);
+        assert_eq!(
+            cluster_info.tvu_peers(GossipContactInfo::clone).len(),
+            nodes.len() - 1
+        );
         let cluster_nodes =
             ClusterNodes::<BroadcastStage>::new(&cluster_info, ClusterType::Development, &stakes);
         // All nodes with contact-info should be in the index.
@@ -908,10 +986,10 @@ mod tests {
         let mut nodes: Vec<Node> = std::iter::repeat_with(|| {
             let pubkey = pubkeys.choose(&mut rng).copied().unwrap();
             let stake = stakes[&pubkey];
-            let node = ContactInfo::new_localhost(&pubkey, /*wallclock:*/ timestamp());
+            let node = GossipContactInfo::new_localhost(&pubkey, /*wallclock:*/ timestamp());
             [
                 Node {
-                    node: NodeId::from(node),
+                    node: NodeId::from(ContactInfo::from(&node)),
                     stake,
                 },
                 Node {

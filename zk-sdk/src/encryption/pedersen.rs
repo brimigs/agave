@@ -28,6 +28,7 @@ lazy_static::lazy_static! {
 }
 
 /// Algorithm handle for the Pedersen commitment scheme.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Pedersen;
 impl Pedersen {
     /// On input a message (numeric amount), the function returns a Pedersen commitment of the
@@ -62,12 +63,30 @@ impl Pedersen {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+impl Pedersen {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = withU64))]
+    pub fn with_u64(amount: u64, opening: &PedersenOpening) -> PedersenCommitment {
+        Pedersen::with(amount, opening)
+    }
+}
+
 /// Pedersen opening type.
 ///
 /// Instances of Pedersen openings are zeroized on drop.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 pub struct PedersenOpening(Scalar);
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+impl PedersenOpening {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = newRand))]
+    pub fn new_rand() -> Self {
+        PedersenOpening(Scalar::random(&mut OsRng))
+    }
+}
+
 impl PedersenOpening {
     pub fn new(scalar: Scalar) -> Self {
         Self(scalar)
@@ -75,10 +94,6 @@ impl PedersenOpening {
 
     pub fn get_scalar(&self) -> &Scalar {
         &self.0
-    }
-
-    pub fn new_rand() -> Self {
-        PedersenOpening(Scalar::random(&mut OsRng))
     }
 
     pub fn as_bytes(&self) -> &[u8; PEDERSEN_OPENING_LEN] {
@@ -110,7 +125,7 @@ impl ConstantTimeEq for PedersenOpening {
     }
 }
 
-impl<'a, 'b> Add<&'b PedersenOpening> for &'a PedersenOpening {
+impl<'b> Add<&'b PedersenOpening> for &PedersenOpening {
     type Output = PedersenOpening;
 
     fn add(self, opening: &'b PedersenOpening) -> PedersenOpening {
@@ -124,7 +139,7 @@ define_add_variants!(
     Output = PedersenOpening
 );
 
-impl<'a, 'b> Sub<&'b PedersenOpening> for &'a PedersenOpening {
+impl<'b> Sub<&'b PedersenOpening> for &PedersenOpening {
     type Output = PedersenOpening;
 
     fn sub(self, opening: &'b PedersenOpening) -> PedersenOpening {
@@ -138,7 +153,7 @@ define_sub_variants!(
     Output = PedersenOpening
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a PedersenOpening {
+impl<'b> Mul<&'b Scalar> for &PedersenOpening {
     type Output = PedersenOpening;
 
     fn mul(self, scalar: &'b Scalar) -> PedersenOpening {
@@ -152,7 +167,7 @@ define_mul_variants!(
     Output = PedersenOpening
 );
 
-impl<'a, 'b> Mul<&'b PedersenOpening> for &'a Scalar {
+impl<'b> Mul<&'b PedersenOpening> for &Scalar {
     type Output = PedersenOpening;
 
     fn mul(self, opening: &'b PedersenOpening) -> PedersenOpening {
@@ -196,7 +211,7 @@ impl PedersenCommitment {
     }
 }
 
-impl<'a, 'b> Add<&'b PedersenCommitment> for &'a PedersenCommitment {
+impl<'b> Add<&'b PedersenCommitment> for &PedersenCommitment {
     type Output = PedersenCommitment;
 
     fn add(self, commitment: &'b PedersenCommitment) -> PedersenCommitment {
@@ -210,7 +225,7 @@ define_add_variants!(
     Output = PedersenCommitment
 );
 
-impl<'a, 'b> Sub<&'b PedersenCommitment> for &'a PedersenCommitment {
+impl<'b> Sub<&'b PedersenCommitment> for &PedersenCommitment {
     type Output = PedersenCommitment;
 
     fn sub(self, commitment: &'b PedersenCommitment) -> PedersenCommitment {
@@ -224,7 +239,7 @@ define_sub_variants!(
     Output = PedersenCommitment
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a PedersenCommitment {
+impl<'b> Mul<&'b Scalar> for &PedersenCommitment {
     type Output = PedersenCommitment;
 
     fn mul(self, scalar: &'b Scalar) -> PedersenCommitment {
@@ -238,7 +253,7 @@ define_mul_variants!(
     Output = PedersenCommitment
 );
 
-impl<'a, 'b> Mul<&'b PedersenCommitment> for &'a Scalar {
+impl<'b> Mul<&'b PedersenCommitment> for &Scalar {
     type Output = PedersenCommitment;
 
     fn mul(self, commitment: &'b PedersenCommitment) -> PedersenCommitment {

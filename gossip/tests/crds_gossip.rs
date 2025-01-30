@@ -101,7 +101,7 @@ fn star_network_create(num: usize) -> Network {
     let gossip_port_offset = 9000;
     let node_keypair = Arc::new(Keypair::new());
     let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-    let entry = CrdsValue::new(CrdsData::ContactInfo(contact_info.clone()), &node_keypair);
+    let entry = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
     let mut network: HashMap<_, _> = (1..num)
         .map(|k| {
             let node_keypair = Arc::new(Keypair::new());
@@ -112,7 +112,7 @@ fn star_network_create(num: usize) -> Network {
             contact_info
                 .set_gossip((Ipv4Addr::LOCALHOST, gossip_port))
                 .unwrap();
-            let new = CrdsValue::new(CrdsData::ContactInfo(contact_info.clone()), &node_keypair);
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             {
                 let mut node_crds = node.crds.write().unwrap();
@@ -142,7 +142,7 @@ fn star_network_create(num: usize) -> Network {
 fn rstar_network_create(num: usize) -> Network {
     let node_keypair = Arc::new(Keypair::new());
     let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-    let entry = CrdsValue::new(CrdsData::ContactInfo(contact_info.clone()), &node_keypair);
+    let entry = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
     let origin = CrdsGossip::default();
     let id = entry.label().pubkey();
     origin
@@ -155,7 +155,7 @@ fn rstar_network_create(num: usize) -> Network {
         .map(|_| {
             let node_keypair = Arc::new(Keypair::new());
             let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-            let new = CrdsValue::new(CrdsData::ContactInfo(contact_info.clone()), &node_keypair);
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             node.crds
                 .write()
@@ -182,7 +182,7 @@ fn ring_network_create(num: usize) -> Network {
         .map(|_| {
             let node_keypair = Arc::new(Keypair::new());
             let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-            let new = CrdsValue::new(CrdsData::ContactInfo(contact_info.clone()), &node_keypair);
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             node.crds
                 .write()
@@ -217,7 +217,7 @@ fn connected_staked_network_create(stakes: &[u64]) -> Network {
         .map(|n| {
             let node_keypair = Arc::new(Keypair::new());
             let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-            let new = CrdsValue::new(CrdsData::ContactInfo(contact_info.clone()), &node_keypair);
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             node.crds
                 .write()
@@ -376,10 +376,20 @@ fn network_run_push(
                     Duration::from_millis(node.gossip.pull.crds_timeout),
                 );
                 node.gossip.purge(&node_pubkey, thread_pool, now, &timeouts);
-                (
-                    node_pubkey,
-                    node.gossip.new_push_messages(&node_pubkey, now, &stakes).0,
-                )
+                let (entries, messages, _) = node.gossip.new_push_messages(
+                    &node_pubkey,
+                    now,
+                    &stakes,
+                    |_| true, // should_retain_crds_value
+                );
+                let messages = messages
+                    .into_iter()
+                    .map(|(pubkey, indices)| {
+                        let values = indices.into_iter().map(|k| entries[k].clone()).collect();
+                        (pubkey, values)
+                    })
+                    .collect::<Vec<(_, Vec<_>)>>();
+                (node_pubkey, messages)
             })
             .collect();
         let transfered: Vec<_> = requests
@@ -577,6 +587,7 @@ fn network_run_pull(
                                 &filters,
                                 usize::MAX, // output_size_limit
                                 now,
+                                |_| true, // should_retain_crds_value
                                 &GossipStats::default(),
                             )
                             .into_iter()
@@ -772,7 +783,7 @@ fn test_prune_errors() {
         .write()
         .unwrap()
         .insert(
-            CrdsValue::new(CrdsData::ContactInfo(ci.clone()), &Keypair::new()),
+            CrdsValue::new(CrdsData::from(&ci), &Keypair::new()),
             0,
             GossipRoute::LocalMessage,
         )
