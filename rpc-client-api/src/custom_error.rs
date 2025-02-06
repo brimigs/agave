@@ -30,6 +30,8 @@ pub const JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE: i64 = -32019;
 
 #[derive(Error, Debug)]
 pub enum RpcCustomError {
+    #[error("Warp slot not in the future")]
+    InvalidWarpSlot,
     #[error("BlockCleanedUp")]
     BlockCleanedUp {
         slot: Slot,
@@ -121,6 +123,11 @@ impl From<RpcCustomError> for Error {
                     "Block {slot} cleaned up, does not exist on node. First available block: \
                      {first_available_block}",
                 ),
+                data: None,
+            },
+            RpcCustomError::InvalidWarpSlot => Self {
+                code: ErrorCode::InvalidParams,
+                message: "Warp slot not in the future".to_string(),
                 data: None,
             },
             RpcCustomError::SendTransactionPreflightFailure { message, result } => Self {

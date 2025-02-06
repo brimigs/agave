@@ -49,6 +49,7 @@ use {
     },
     tokio_util::codec::{BytesCodec, FramedRead},
 };
+use crate::test_validator_rpc::TestValidatorJsonRpcRequestProcessor;
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
 const INCREMENTAL_SNAPSHOT_REQUEST_PATH: &str = "/incremental-snapshot.tar.bz2";
@@ -58,7 +59,7 @@ pub struct JsonRpcService {
     thread_hdl: JoinHandle<()>,
 
     #[cfg(test)]
-    pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
+    pub request_processor: TestValidatorJsonRpcRequestProcessor, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
 }
