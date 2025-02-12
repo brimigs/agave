@@ -1,6 +1,8 @@
 //! The `rpc` module implements the Solana RPC interface.
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
+use crate::test_validator_rpc::TestValidatorJsonRpcRequestProcessor;
+
 use {
     crate::{
         filter::filter_allows, max_slots::MaxSlots,
@@ -153,6 +155,58 @@ fn is_finalized(
 ) -> bool {
     slot <= block_commitment_cache.highest_super_majority_root()
         && (blockstore.is_root(slot) || bank.status_cache_ancestors().contains(&slot))
+}
+
+#[derive(Debug, Clone)]
+pub enum RpcProcessorType {
+    Standard,
+    Test,
+}
+
+pub trait RpcRequestProcessorTrait: Send + Sync {
+    // Example method; add others as needed
+    fn process_request(&self, request: String) -> String;
+    fn clone_without_bigtable(&self) -> Box<dyn RpcRequestProcessorTrait>;
+    fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait>;
+}
+
+impl Clone for Box<dyn RpcRequestProcessorTrait> {
+    fn clone(&self) -> Box<dyn RpcRequestProcessorTrait> {
+        self.clone_box()
+    }
+}
+
+// TODO: Clean this up - just needed it for the Boxed trait object
+impl RpcRequestProcessorTrait for JsonRpcRequestProcessor {
+    fn process_request(&self, request: String) -> String {
+        // Standard implementation
+        format!("Standard processed: {}", request)
+    }
+    fn clone_without_bigtable(&self) -> Box<dyn RpcRequestProcessorTrait> {
+        Box::new(self.clone_without_bigtable())
+    }
+    fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait> {
+        Box::new(self.clone())
+    }
+}
+
+impl RpcRequestProcessorTrait for TestValidatorJsonRpcRequestProcessor {
+    fn process_request(&self, request: String) -> String {
+        // Specialized test implementation (or delegate using self.deref())
+        format!("Test processed: {}", request)
+    }
+
+    fn clone_without_bigtable(&self) -> Box<dyn RpcRequestProcessorTrait> {
+        Box::new(TestValidatorJsonRpcRequestProcessor {
+            base: self.base.clone_without_bigtable(),
+            poh_recorder: Arc::clone(&self.poh_recorder),
+            bank_forks: Arc::clone(&self.bank_forks),
+            block_commitment_cache: Arc::clone(&self.block_commitment_cache),
+        })
+    }
+    fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait> {
+        Box::new((*self).clone())
+    }
 }
 
 #[derive(Debug, Clone)]

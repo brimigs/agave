@@ -7,7 +7,7 @@ use {
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         rpc::{rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_full::*, rpc_minimal::*, *},
         rpc_cache::LargestAccountsCache,
-        rpc_health::*,
+        rpc_health::*, test_validator_rpc::TestValidatorJsonRpcRequestProcessor,
     },
     crossbeam_channel::unbounded,
     jsonrpc_core::{futures::prelude::*, MetaIoHandler},
@@ -58,7 +58,7 @@ pub struct JsonRpcService {
     thread_hdl: JoinHandle<()>,
 
     #[cfg(test)]
-    pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
+    pub request_processor: RpcProcessorType, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
 }
@@ -355,6 +355,7 @@ impl JsonRpcService {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        processor_type: RpcProcessorType,
     ) -> Result<Self, String> {
         info!("rpc bound to {:?}", rpc_addr);
         info!("rpc configuration: {:?}", config);
@@ -444,26 +445,70 @@ impl JsonRpcService {
         let max_request_body_size = config
             .max_request_body_size
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
-        let (request_processor, receiver) = JsonRpcRequestProcessor::new(
-            config,
-            snapshot_config.clone(),
-            bank_forks.clone(),
-            block_commitment_cache,
-            blockstore,
-            validator_exit.clone(),
-            health.clone(),
-            cluster_info.clone(),
-            genesis_hash,
-            bigtable_ledger_storage,
-            optimistically_confirmed_bank,
-            largest_accounts_cache,
-            max_slots,
-            leader_schedule_cache,
-            max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
-            prioritization_fee_cache,
-            Arc::clone(&runtime),
-        );
+        let (request_processor, receiver) = match processor_type {
+            RpcProcessorType::Standard => {
+                // Create the standard processor.
+                let (processor, receiver) = JsonRpcRequestProcessor::new(
+                    config,
+                    snapshot_config.clone(),
+                    bank_forks.clone(),
+                    block_commitment_cache.clone(),
+                    blockstore,
+                    validator_exit.clone(),
+                    health.clone(),
+                    cluster_info.clone(),
+                    genesis_hash,
+                    bigtable_ledger_storage,
+                    optimistically_confirmed_bank,
+                    largest_accounts_cache,
+                    max_slots,
+                    leader_schedule_cache,
+                    max_complete_transaction_status_slot,
+                    max_complete_rewards_slot,
+                    prioritization_fee_cache,
+                    Arc::clone(&runtime),
+                );
+                // Box it as a trait object.
+                (Box::new(processor) as Box<dyn RpcRequestProcessorTrait>, receiver)
+            }
+        
+            RpcProcessorType::Test => {
+                // For the test variant we expect that a POH recorder is available.
+                // Create the base (standard) processor first.
+                let (base_processor, receiver) = JsonRpcRequestProcessor::new(
+                    config,
+                    snapshot_config.clone(),
+                    bank_forks.clone(),
+                    block_commitment_cache.clone(),
+                    blockstore,
+                    validator_exit.clone(),
+                    health.clone(),
+                    cluster_info.clone(),
+                    genesis_hash,
+                    bigtable_ledger_storage,
+                    optimistically_confirmed_bank,
+                    largest_accounts_cache,
+                    max_slots,
+                    leader_schedule_cache,
+                    max_complete_transaction_status_slot,
+                    max_complete_rewards_slot,
+                    prioritization_fee_cache,
+                    Arc::clone(&runtime),
+                );
+                // Ensure that for the test processor the POH recorder is provided.
+                let test_poh_recorder = poh_recorder
+                    .expect("Test RPC requires a POH recorder to be provided in the configuration");
+        
+                let test_processor = TestValidatorJsonRpcRequestProcessor {
+                    base: base_processor,
+                    poh_recorder: test_poh_recorder,
+                    bank_forks: bank_forks.clone(),
+                    block_commitment_cache: block_commitment_cache.clone(),
+                };
+        
+                (Box::new(test_processor) as Box<dyn RpcRequestProcessorTrait>, receiver)
+            }
+        };
 
         let leader_info =
             poh_recorder.map(|recorder| ClusterTpuInfo::new(cluster_info.clone(), recorder));
@@ -554,7 +599,7 @@ impl JsonRpcService {
         Ok(Self {
             thread_hdl,
             #[cfg(test)]
-            request_processor: test_request_processor,
+            request_processor: Test,
             close_handle: Some(close_handle),
         })
     }

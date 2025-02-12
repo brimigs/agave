@@ -30,7 +30,7 @@ use {
         create_new_tmp_ledger,
     },
     solana_net_utils::PortRange,
-    solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
+    solana_rpc::{rpc::{JsonRpcConfig, RpcProcessorType}, rpc_pubsub_service::PubSubConfig},
     solana_rpc_client::{nonblocking, rpc_client::RpcClient},
     solana_rpc_client_api::request::MAX_MULTIPLE_ACCOUNTS,
     solana_runtime::{
@@ -137,6 +137,7 @@ pub struct TestValidatorGenesis {
     pub tpu_enable_udp: bool,
     pub geyser_plugin_manager: Arc<RwLock<GeyserPluginManager>>,
     admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
+    pub rpc_processor_type: RpcProcessorType,
 }
 
 impl Default for TestValidatorGenesis {
@@ -170,6 +171,7 @@ impl Default for TestValidatorGenesis {
             geyser_plugin_manager: Arc::new(RwLock::new(GeyserPluginManager::new())),
             admin_rpc_service_post_init:
                 Arc::<RwLock<Option<AdminRpcRequestMetadataPostInit>>>::default(),
+            rpc_processor_type: RpcProcessorType::Test,
         }
     }
 }
@@ -225,6 +227,12 @@ impl TestValidatorGenesis {
 
     pub fn tower_storage(&mut self, tower_storage: Arc<dyn TowerStorage>) -> &mut Self {
         self.tower_storage = Some(tower_storage);
+        self
+    }
+
+    /// Set the RPC processor type.
+    pub fn rpc_processor_type(&mut self, processor: RpcProcessorType) -> &mut Self {
+        self.rpc_processor_type = processor;
         self
     }
 

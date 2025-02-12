@@ -1,6 +1,7 @@
 //! The `validator` module hosts all the validator microservices.
 
 pub use solana_perf::report_target_features;
+use solana_rpc::rpc::RpcProcessorType;
 use {
     crate::{
         accounts_hash_verifier::AccountsHashVerifier,
@@ -316,6 +317,7 @@ pub struct ValidatorConfig {
     pub tvu_shred_sigverify_threads: NonZeroUsize,
     pub thread_manager_config: ThreadManagerConfig,
     pub delay_leader_block_for_pending_fork: bool,
+    pub rpc_processor_type: RpcProcessorType,
 }
 
 impl Default for ValidatorConfig {
@@ -390,6 +392,7 @@ impl Default for ValidatorConfig {
             thread_manager_config: ThreadManagerConfig::default_for_agave(),
             tvu_shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             delay_leader_block_for_pending_fork: false,
+            rpc_processor_type: RpcProcessorType::Standard,
         }
     }
 }

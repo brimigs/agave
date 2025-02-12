@@ -306,9 +306,22 @@ pub struct PohRecorder {
     delay_leader_block_for_pending_fork: bool,
     last_reported_slot_for_pending_fork: Arc<Mutex<Slot>>,
     pub is_exited: Arc<AtomicBool>,
+    pub paused: Arc<AtomicBool>,
 }
 
 impl PohRecorder {
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+    
     fn clear_bank(&mut self) {
         if let Some(WorkingBank { bank, start, .. }) = self.working_bank.take() {
             self.leader_bank_notifier.set_completed(bank.slot());
@@ -1075,6 +1088,7 @@ impl PohRecorder {
                 delay_leader_block_for_pending_fork,
                 last_reported_slot_for_pending_fork: Arc::default(),
                 is_exited,
+                paused: Arc::new(AtomicBool::new(false)),
             },
             working_bank_receiver,
             record_receiver,

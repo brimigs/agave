@@ -17,6 +17,7 @@ pub mod rpc_subscriptions;
 pub mod slot_status_notifier;
 pub mod transaction_notifier_interface;
 pub mod transaction_status_service;
+pub mod test_validator_rpc;
 
 #[macro_use]
 extern crate log;

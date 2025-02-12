@@ -336,6 +336,15 @@ impl PohService {
         let mut timing = PohTiming::new();
         let mut next_record = None;
         loop {
+            {
+                // Check if paused. If so, sleep and continue without ticking.
+                let recorder = poh_recorder.read().unwrap();
+                if recorder.is_paused() {
+                    drop(recorder);
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            }
             let should_tick = Self::record_or_hash(
                 &mut next_record,
                 &poh_recorder,
