@@ -225,6 +225,7 @@ pub struct JsonRpcConfig {
     pub max_request_body_size: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
+    pub processor_type: RpcProcessorType,
 }
 
 impl Default for JsonRpcConfig {
@@ -245,6 +246,7 @@ impl Default for JsonRpcConfig {
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
             disable_health_check: Default::default(),
+            processor_type: RpcProcessorType::Test,
         }
     }
 }

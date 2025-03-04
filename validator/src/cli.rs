@@ -2236,6 +2236,12 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
             }
         })
         .arg(
+            Arg::with_name("use_test_rpc_processor")
+                .long("use-test-rpc-processor")
+                .takes_value(false)
+                .help("Use the TEST RPC processor configuration"),
+        )
+        .arg(
             Arg::with_name("json_rpc_url")
                 .short("u")
                 .long("url")

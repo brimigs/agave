@@ -231,7 +231,7 @@ impl TestValidatorGenesis {
     }
 
     /// Set the RPC processor type.
-    pub fn rpc_processor_type(&mut self, processor: RpcProcessorType) -> &mut Self {
+    pub fn set_rpc_processor_type(&mut self, processor: RpcProcessorType) -> &mut Self {
         self.rpc_processor_type = processor;
         self
     }

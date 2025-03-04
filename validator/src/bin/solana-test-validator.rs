@@ -12,10 +12,10 @@ use {
         input_parsers::{pubkey_of, pubkeys_of, value_of},
         input_validators::normalize_to_url_if_moniker,
     },
-    solana_core::consensus::tower_storage::FileTowerStorage,
+    solana_core::{consensus::tower_storage::FileTowerStorage, validator::ValidatorConfig},
     solana_faucet::faucet::run_local_faucet_with_port,
     solana_rpc::{
-        rpc::{JsonRpcConfig, RpcBigtableConfig},
+        rpc::{JsonRpcConfig, RpcBigtableConfig, RpcProcessorType},
         rpc_pubsub_service::PubSubConfig,
     },
     solana_rpc_client::rpc_client::RpcClient,
@@ -439,6 +439,22 @@ fn main() {
     } else {
         None
     };
+
+    let use_test_rpc_processor = matches.is_present("use_test_rpc_processor");
+
+    // let mut validator_config = ValidatorConfig {
+    //     rpc_processor_type: if use_test_rpc_processor {
+    //          RpcProcessorType::Test
+    //     } else {
+    //         RpcProcessorType::Standard
+    //     },
+    // };
+
+    if use_test_rpc_processor { 
+        validator_config.rpc_processor_type = RpcProcessorType::Test;
+    } else {
+        validator_config.rpc_processor_type = RpcProcessorType::Standard;
+    }
 
     genesis
         .ledger_path(&ledger_path)
