@@ -33,7 +33,7 @@ pub struct TestValidatorJsonRpcRequestProcessor {
 }
 
 impl TestValidatorJsonRpcRequestProcessor {
-    pub fn warp_slot(&self, target_slot: u64) -> Result<()> {
+    pub fn warp_slot_impl(&self, target_slot: u64) -> Result<()> {
         let mut bank_forks = self.bank_forks.write().unwrap();
         let bank = bank_forks.working_bank();
         let poh_recorder = self.poh_recorder.write().unwrap();

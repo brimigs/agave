@@ -10,7 +10,7 @@ use {
         rpc_health::*, test_validator_rpc::TestValidatorJsonRpcRequestProcessor,
     },
     crossbeam_channel::unbounded,
-    jsonrpc_core::{futures::prelude::*, MetaIoHandler},
+    jsonrpc_core::{futures::prelude::*, MetaIoHandler, Params},
     jsonrpc_http_server::{
         hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
         RequestMiddlewareAction, ServerBuilder,
@@ -355,20 +355,24 @@ impl JsonRpcService {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
-        processor_type: RpcProcessorType,
+        rpc_processor_type_override: Option<RpcProcessorType>,
     ) -> Result<Self, String> {
         info!("rpc bound to {:?}", rpc_addr);
         info!("rpc configuration: {:?}", config);
+        info!("JsonRpcService::new called with processor_type_override: {:?}", rpc_processor_type_override);
+
         let rpc_threads = 1.max(config.rpc_threads);
         let rpc_blocking_threads = 1.max(config.rpc_blocking_threads);
         let rpc_niceness_adj = config.rpc_niceness_adj;
+
+        let processor_type = rpc_processor_type_override.unwrap_or(RpcProcessorType::Test);
 
         let health = Arc::new(RpcHealth::new(
             Arc::clone(&optimistically_confirmed_bank),
             Arc::clone(&blockstore),
             config.health_check_slot_distance,
             override_health_check,
-            startup_verification_complete,
+            startup_verification_complete, 
         ));
 
         let largest_accounts_cache = Arc::new(RwLock::new(LargestAccountsCache::new(
@@ -447,6 +451,7 @@ impl JsonRpcService {
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
         let (request_processor, receiver) = match processor_type {
             RpcProcessorType::Standard => {
+                info!("Creating STANDARD RPC processor");
                 // Create the standard processor.
                 let (processor, receiver) = JsonRpcRequestProcessor::new(
                     config,
@@ -473,6 +478,7 @@ impl JsonRpcService {
             }
         
             RpcProcessorType::Test => {
+                info!("Creating TEST RPC processor");
                 // For the test variant we expect that a POH recorder is available.
                 // Create the base (standard) processor first.
                 let (base_processor, receiver) = JsonRpcRequestProcessor::new(
@@ -542,6 +548,24 @@ impl JsonRpcService {
                     io.extend_with(rpc_accounts_scan::AccountsScanImpl.to_delegate());
                     io.extend_with(rpc_full::FullImpl.to_delegate());
                 }
+
+                let rp_clone = request_processor.clone();
+
+                io.add_sync_method("warpSlot", move |params: Params| {
+                    let slots = params.parse::<Vec<u64>>()?;
+                    if slots.len() != 1 {
+                        return Err(jsonrpc_core::Error::invalid_params("Expected exactly 1 slot param"));
+                    }
+                    let slot = slots[0];
+                
+                    rp_clone
+                        .warp_slot(slot)
+                        .map_err(|err_str| {
+                            jsonrpc_core::Error::invalid_params(format!("warp_slot failed: {}", err_str))
+                        })?;
+                
+                    Ok(jsonrpc_core::Value::String(format!("Warped to slot {slot} successfully!")))
+                });
 
                 let request_middleware = RpcRequestMiddleware::new(
                     ledger_path,

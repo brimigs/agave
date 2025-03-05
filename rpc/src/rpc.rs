@@ -169,6 +169,15 @@ pub trait RpcRequestProcessorTrait: Send + Sync {
     fn clone_without_bigtable(&self) -> Box<dyn RpcRequestProcessorTrait>;
     fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait>;   
     fn get_base(&self) -> &JsonRpcRequestProcessor;
+    fn as_any(&self) -> &dyn std::any::Any;
+    // Add this method to identify test processors
+    fn is_test_processor(&self) -> bool {
+        false // Default implementation returns false
+    }
+    
+    fn warp_slot(&self, _slot: u64) -> Result<()> {
+        Err(Error::invalid_params("warp_slot is only available in test validator mode"))
+    }
 }
 
 impl Clone for Box<dyn RpcRequestProcessorTrait> {
@@ -188,22 +197,46 @@ impl RpcRequestProcessorTrait for JsonRpcRequestProcessor {
     fn get_base(&self) -> &JsonRpcRequestProcessor {
         &self
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl RpcRequestProcessorTrait for TestValidatorJsonRpcRequestProcessor {
     fn clone_without_bigtable(&self) -> Box<dyn RpcRequestProcessorTrait> {
-        Box::new(TestValidatorJsonRpcRequestProcessor {
+        // Implementation details
+        Box::new(Self {
             base: self.base.clone_without_bigtable(),
-            poh_recorder: Arc::clone(&self.poh_recorder),
-            bank_forks: Arc::clone(&self.bank_forks),
-            block_commitment_cache: Arc::clone(&self.block_commitment_cache),
+            poh_recorder: self.poh_recorder.clone(),
+            bank_forks: self.bank_forks.clone(),
+            block_commitment_cache: self.block_commitment_cache.clone(),
         })
     }
+    
     fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait> {
-        Box::new((*self).clone())
+        Box::new(Self {
+            base: self.base.clone(),
+            poh_recorder: self.poh_recorder.clone(),
+            bank_forks: self.bank_forks.clone(),
+            block_commitment_cache: self.block_commitment_cache.clone(),
+        })
     }
+    
     fn get_base(&self) -> &JsonRpcRequestProcessor {
         &self.base
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    
+    fn is_test_processor(&self) -> bool {
+        true
+    }
+    
+    fn warp_slot(&self, slot: u64) -> Result<()> {
+        // Call the implementation method to avoid recursion
+        self.warp_slot_impl(slot)
     }
 }
 

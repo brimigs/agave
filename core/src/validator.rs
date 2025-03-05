@@ -317,7 +317,6 @@ pub struct ValidatorConfig {
     pub tvu_shred_sigverify_threads: NonZeroUsize,
     pub thread_manager_config: ThreadManagerConfig,
     pub delay_leader_block_for_pending_fork: bool,
-    pub rpc_processor_type: RpcProcessorType,
 }
 
 impl Default for ValidatorConfig {
@@ -392,7 +391,6 @@ impl Default for ValidatorConfig {
             thread_manager_config: ThreadManagerConfig::default_for_agave(),
             tvu_shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             delay_leader_block_for_pending_fork: false,
-            rpc_processor_type: RpcProcessorType::Standard,
         }
     }
 }
@@ -403,7 +401,6 @@ impl ValidatorConfig {
             NonZeroUsize::new(get_max_thread_count()).expect("thread count is non-zero");
 
         Self {
-            rpc_processor_type: RpcProcessorType::Test,
             accounts_db_config: Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
             blockstore_options: BlockstoreOptions::default_for_tests(),
             rpc_config: JsonRpcConfig::default_for_test(),
@@ -614,7 +611,7 @@ impl Validator {
         socket_addr_space: SocketAddrSpace,
         tpu_config: ValidatorTpuConfig,
         admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
-        rpc_processor_type: RpcProcessorType,
+        rpc_processor_type: Option<RpcProcessorType>,
     ) -> Result<Self> {
         let ValidatorTpuConfig {
             use_quic,
@@ -627,6 +624,8 @@ impl Validator {
         } = tpu_config;
 
         let start_time = Instant::now();
+
+        let rpc_processor_type = rpc_processor_type.unwrap_or(RpcProcessorType::Test);
 
         let thread_manager = ThreadManager::new(&config.thread_manager_config)?;
         // Initialize the global rayon pool first to ensure the value in config
@@ -1191,7 +1190,7 @@ impl Validator {
                 max_complete_transaction_status_slot,
                 max_complete_rewards_slot,
                 prioritization_fee_cache.clone(),
-                config.rpc_processor_type.clone(),
+                Some(rpc_processor_type),
             )
             .map_err(ValidatorError::Other)?;
 

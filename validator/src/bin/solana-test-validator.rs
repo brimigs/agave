@@ -12,7 +12,7 @@ use {
         input_parsers::{pubkey_of, pubkeys_of, value_of},
         input_validators::normalize_to_url_if_moniker,
     },
-    solana_core::{consensus::tower_storage::FileTowerStorage, validator::ValidatorConfig},
+    solana_core::consensus::tower_storage::FileTowerStorage,
     solana_faucet::faucet::run_local_faucet_with_port,
     solana_rpc::{
         rpc::{JsonRpcConfig, RpcBigtableConfig, RpcProcessorType},
@@ -442,18 +442,13 @@ fn main() {
 
     let use_test_rpc_processor = matches.is_present("use_test_rpc_processor");
 
-    // let mut validator_config = ValidatorConfig {
-    //     rpc_processor_type: if use_test_rpc_processor {
-    //          RpcProcessorType::Test
-    //     } else {
-    //         RpcProcessorType::Standard
-    //     },
-    // };
-
-    if use_test_rpc_processor { 
-        validator_config.rpc_processor_type = RpcProcessorType::Test;
+    // Set the RPC processor type in the genesis configuration
+    if use_test_rpc_processor {
+        info!("Setting RPC processor type to TEST");
+        genesis.set_rpc_processor_type(RpcProcessorType::Test);
     } else {
-        validator_config.rpc_processor_type = RpcProcessorType::Standard;
+        info!("Setting RPC processor type to STANDARD");
+        genesis.set_rpc_processor_type(RpcProcessorType::Test);
     }
 
     genesis
