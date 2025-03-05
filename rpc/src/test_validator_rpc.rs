@@ -16,6 +16,7 @@ use solana_rpc_client_api::custom_error::RpcCustomError;
 use solana_sdk::hash::Hash;
 use solana_runtime::accounts_background_service::{AbsRequestSender, SnapshotRequestKind};
 use crate::rpc::JsonRpcRequestProcessor;
+use solana_core::consensus::progress_map::{ForkProgress, ProgressMap};
 
 // Allow automatic forwarding of method calls to the base implementation
 impl Deref for TestValidatorJsonRpcRequestProcessor {
@@ -30,13 +31,14 @@ pub struct TestValidatorJsonRpcRequestProcessor {
     pub poh_recorder: Arc<RwLock<PohRecorder>>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+    pub progress: Arc<RwLock<ProgressMap>>
 }
 
 impl TestValidatorJsonRpcRequestProcessor {
     pub fn warp_slot_impl(&self, target_slot: u64) -> Result<()> {
         let mut bank_forks = self.bank_forks.write().unwrap();
         let bank = bank_forks.working_bank();
-        let poh_recorder = self.poh_recorder.write().unwrap();
+        let mut poh_recorder = self.poh_recorder.write().unwrap();
         poh_recorder.pause();
         let working_slot = bank.slot();
         if target_slot <= working_slot {
@@ -83,6 +85,19 @@ impl TestValidatorJsonRpcRequestProcessor {
             &Pubkey::default(),
             target_slot,
         ));
+        let mut progress = self.progress.write().unwrap();
+        progress.insert(
+            target_slot,
+            ForkProgress::new_from_bank(
+                &bank,
+                &Pubkey::default(), // validator identity
+                &Pubkey::default(), // vote account
+                Some(pre_warp_slot), // prev_leader_slot
+                0, // num_blocks_on_fork
+                0, // num_dropped_blocks_on_fork
+            )
+        );
+        poh_recorder.reset(bank_forks.get(target_slot).unwrap(), None);
         poh_recorder.resume();
         let mut w_block_commitment_cache = self.block_commitment_cache.write().unwrap();
         w_block_commitment_cache.set_all_slots(target_slot, target_slot);

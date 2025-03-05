@@ -32,6 +32,7 @@ soketto = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-accounts-db = { workspace = true }
 solana-client = { workspace = true }
+solana-core = { path = "../core", version = "=2.2.0", features = ["full"] }
 solana-entry = { workspace = true }
 solana-faucet = { workspace = true }
 solana-feature-set = { workspace = true }

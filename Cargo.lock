@@ -8892,6 +8892,7 @@ dependencies = [
  "solana-account-decoder",
  "solana-accounts-db",
  "solana-client",
+ "solana-core",
  "solana-entry",
  "solana-faucet",
  "solana-feature-set",
