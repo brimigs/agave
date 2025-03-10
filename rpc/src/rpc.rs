@@ -178,6 +178,29 @@ pub trait RpcRequestProcessorTrait: Send + Sync {
     fn warp_slot(&self, _slot: u64) -> Result<()> {
         Err(Error::invalid_params("warp_slot is only available in test validator mode"))
     }
+    fn set_account(&self, _address: &Pubkey, _account: &AccountSharedData) -> Result<()> {
+        Err(Error::invalid_params("set_account is only available in test validator mode"))
+    }
+    fn set_clock(&self, _slot: u64, _unix_timestamp: i64, _epoch: Option<u64>) -> Result<()> {
+        Err(Error::invalid_params("setClock is only available in test validator mode"))
+    }
+    fn update_token_account(
+        &self,
+        _token_account: Option<&Pubkey>,
+        _mint: Option<&Pubkey>,
+        _owner: Option<&Pubkey>,
+        _amount: Option<u64>,
+    ) -> Result<Pubkey> {
+        Err(Error::invalid_request())
+    }
+
+    fn clone_account_from_cluster(
+        &self,
+        _address: &Pubkey,
+        _url: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::invalid_request())
+    }
 }
 
 impl Clone for Box<dyn RpcRequestProcessorTrait> {
@@ -199,6 +222,15 @@ impl RpcRequestProcessorTrait for JsonRpcRequestProcessor {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+    fn update_token_account(
+        &self,
+        _token_account: Option<&Pubkey>,
+        _mint: Option<&Pubkey>,
+        _owner: Option<&Pubkey>,
+        _amount: Option<u64>,
+    ) -> Result<Pubkey> {
+        Err(Error::invalid_request())
     }
 }
 
@@ -234,6 +266,38 @@ impl RpcRequestProcessorTrait for TestValidatorJsonRpcRequestProcessor {
         true
     }
     
+    fn set_account(&self, address: &Pubkey, account: &AccountSharedData) -> Result<()> {
+        let bank_forks = self.bank_forks.read().unwrap();
+        let bank = bank_forks.working_bank();
+        bank.store_account(address, account);
+        Ok(())
+    }
+    
+    fn update_token_account(
+        &self,
+        token_account: Option<&Pubkey>,
+        mint: Option<&Pubkey>,
+        owner: Option<&Pubkey>,
+        amount: Option<u64>,
+    ) -> Result<Pubkey> {
+        let result = self.update_token_account_impl(token_account, mint, owner, amount)?;
+        Ok(result)
+    }
+
+    fn clone_account_from_cluster(
+        &self,
+        address: &Pubkey,
+        url: Option<&str>,
+    ) -> Result<()> {
+        self.clone_account_from_cluster_impl(address, url);
+        Ok(())
+    }
+
+    fn set_clock(&self, slot: u64, unix_timestamp: i64, epoch: Option<u64>) -> Result<()> {
+        self.set_clock_impl(slot, unix_timestamp, epoch);
+        Ok(())
+    }
+
     fn warp_slot(&self, slot: u64) -> Result<()> {
         // Call the implementation method to avoid recursion
         self.warp_slot_impl(slot)

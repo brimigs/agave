@@ -8,37 +8,21 @@ use {
         rpc::{rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_full::*, rpc_minimal::*, *},
         rpc_cache::LargestAccountsCache,
         rpc_health::*, test_validator_rpc::TestValidatorJsonRpcRequestProcessor,
-    },
-    crossbeam_channel::unbounded,
-    jsonrpc_core::{futures::prelude::*, MetaIoHandler, Params},
-    jsonrpc_http_server::{
+    }, crossbeam_channel::unbounded, jsonrpc_core::{futures::prelude::*, MetaIoHandler, Params}, jsonrpc_http_server::{
         hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
         RequestMiddlewareAction, ServerBuilder,
-    },
-    regex::Regex,
-    solana_client::connection_cache::ConnectionCache,
-    solana_gossip::cluster_info::ClusterInfo,
-    solana_ledger::{
+    }, regex::Regex, solana_client::connection_cache::ConnectionCache, solana_gossip::cluster_info::ClusterInfo, solana_ledger::{
         bigtable_upload::ConfirmedBlockUploadConfig,
         bigtable_upload_service::BigTableUploadService, blockstore::Blockstore,
         leader_schedule_cache::LeaderScheduleCache,
-    },
-    solana_metrics::inc_new_counter_info,
-    solana_perf::thread::renice_this_thread,
-    solana_poh::poh_recorder::PohRecorder,
-    solana_runtime::{
+    }, solana_metrics::inc_new_counter_info, solana_perf::thread::renice_this_thread, solana_poh::poh_recorder::PohRecorder, solana_pubkey::Pubkey, solana_runtime::{
         bank_forks::BankForks, commitment::BlockCommitmentCache,
         prioritization_fee_cache::PrioritizationFeeCache,
         snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
         snapshot_utils,
-    },
-    solana_sdk::{
-        exit::Exit, genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH, hash::Hash,
-        native_token::lamports_to_sol,
-    },
-    solana_send_transaction_service::send_transaction_service::{self, SendTransactionService},
-    solana_storage_bigtable::CredentialType,
-    std::{
+    }, solana_sdk::{
+        account::{AccountSharedData, WritableAccount}, exit::Exit, genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH, hash::Hash, native_token::lamports_to_sol
+    }, solana_send_transaction_service::send_transaction_service::{self, SendTransactionService}, solana_storage_bigtable::CredentialType, std::{
         net::SocketAddr,
         path::{Path, PathBuf},
         sync::{
@@ -46,8 +30,7 @@ use {
             Arc, RwLock,
         },
         thread::{self, Builder, JoinHandle},
-    },
-    tokio_util::codec::{BytesCodec, FramedRead},
+    }, tokio_util::codec::{BytesCodec, FramedRead}
 };
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
@@ -551,20 +534,247 @@ impl JsonRpcService {
 
                 let rp_clone = request_processor.clone();
 
-                io.add_sync_method("warpSlot", move |params: Params| {
-                    let slots = params.parse::<Vec<u64>>()?;
-                    if slots.len() != 1 {
-                        return Err(jsonrpc_core::Error::invalid_params("Expected exactly 1 slot param"));
+                // io.add_sync_method("warpSlot", move |params: Params| {
+                //     let slots = params.parse::<Vec<u64>>()?;
+                //     if slots.len() != 1 {
+                //         return Err(jsonrpc_core::Error::invalid_params("Expected exactly 1 slot param"));
+                //     }
+                //     let slot = slots[0];
+                
+                //     rp_clone
+                //         .warp_slot(slot)
+                //         .map_err(|err_str| {
+                //             jsonrpc_core::Error::invalid_params(format!("warp_slot failed: {}", err_str))
+                //         })?;
+                
+                //     Ok(jsonrpc_core::Value::String(format!("Warped to slot {slot} successfully!")))
+                // });
+
+                // let rp_clone2 = request_processor.clone();
+
+                io.add_sync_method("setAccount", move |params: Params| {
+                    let param_array = params.parse::<Vec<serde_json::Value>>()?;
+                    if param_array.len() != 2 {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "Expected exactly 2 parameters: [address, accountData]"
+                        ));
                     }
-                    let slot = slots[0];
+                    
+                    // Parse the address
+                    let address_str = param_array[0].as_str().ok_or_else(|| {
+                        jsonrpc_core::Error::invalid_params("Address must be a string")
+                    })?;
+                    let address = address_str.parse::<Pubkey>().map_err(|err| {
+                        jsonrpc_core::Error::invalid_params(format!("Invalid address: {}", err))
+                    })?;
+                    
+                    // Parse the account data
+                    let account_value = &param_array[1];
+                    
+                    // Extract account fields from the JSON
+                    let lamports = account_value.get("lamports")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing or invalid 'lamports' field"))?;
+                    
+                    let owner_str = account_value.get("owner")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing or invalid 'owner' field"))?;
+                    let owner = owner_str.parse::<Pubkey>()
+                        .map_err(|err| jsonrpc_core::Error::invalid_params(format!("Invalid owner pubkey: {}", err)))?;
+                    
+                    let executable = account_value.get("executable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    
+                    let rent_epoch = account_value.get("rentEpoch")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    
+                    // Parse data field which is expected to be [<base64 string>, "base64"]
+                    let data = account_value.get("data")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing or invalid 'data' field"))?;
+                    
+                    if data.len() != 2 || data[1].as_str() != Some("base64") {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "Data field must be in format [<base64 string>, \"base64\"]"
+                        ));
+                    }
+                    
+                    let data_base64 = data[0].as_str()
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Data base64 string must be a string"))?;
+                    
+                    let account_data = base64::decode(data_base64)
+                        .map_err(|err| jsonrpc_core::Error::invalid_params(format!("Invalid base64 data: {}", err)))?;
+                    
+                    // Create the account
+                    let mut account = AccountSharedData::new(
+                        lamports,
+                        account_data.len(),
+                        &owner,
+                    );
+                    account.set_executable(executable);
+                    account.set_rent_epoch(rent_epoch);
+                    account.set_data(account_data);
+                    
+                    // Check if the processor is a test processor
+                    if !rp_clone.is_test_processor() {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "setAccount is only available in test validator mode"
+                        ));
+                    }
+                    
+                    // Downcast to TestValidatorJsonRpcRequestProcessor
+                    let test_processor = rp_clone.as_any().downcast_ref::<TestValidatorJsonRpcRequestProcessor>()
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Failed to access test validator processor"))?;
+                    
+                    // Call the set_account method
+                    // Note: We need to get a mutable reference, but the current implementation only allows immutable references
+                    // This might require modifying the TestValidatorJsonRpcRequestProcessor::set_account method to take &self instead of &mut self
+                    test_processor.set_account(&address, &account);
+                    
+                    Ok(jsonrpc_core::Value::String(format!("Account {} updated successfully", address)))
+                });
+
+                let rp_clone2 = request_processor.clone();
                 
-                    rp_clone
-                        .warp_slot(slot)
-                        .map_err(|err_str| {
-                            jsonrpc_core::Error::invalid_params(format!("warp_slot failed: {}", err_str))
-                        })?;
-                
-                    Ok(jsonrpc_core::Value::String(format!("Warped to slot {slot} successfully!")))
+                io.add_sync_method("updateTokenAccount", move |tokenParams: Params| {
+                    let param_array = tokenParams.parse::<Vec<serde_json::Value>>()?;
+                    
+                    // Parse parameters from the JSON object
+                    let token_account = param_array.get(0).and_then(|v| {
+                        v.as_str().map(|s| s.parse::<Pubkey>().ok()).flatten()
+                    });
+                    
+                    let mint = param_array.get(1).and_then(|v| {
+                        v.as_str().map(|s| s.parse::<Pubkey>().ok()).flatten()
+                    });
+                    
+                    let owner = param_array.get(2).and_then(|v| {
+                        v.as_str().map(|s| s.parse::<Pubkey>().ok()).flatten()
+                    });
+                    
+                    let amount = param_array.get(3).and_then(|v| v.as_u64());
+                    
+                    // Check if at least one parameter is provided
+                    if token_account.is_none() && mint.is_none() {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "Either token_account or mint must be provided"
+                        ));
+                    }
+                    
+                    // Check if the processor is a test processor
+                    if !rp_clone2.is_test_processor() {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "updateTokenAccount is only available in test validator mode"
+                        ));
+                    }
+                    
+                    // Downcast to TestValidatorJsonRpcRequestProcessor
+                    let test_processor = rp_clone2.as_any().downcast_ref::<TestValidatorJsonRpcRequestProcessor>()
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Failed to access test validator processor"))?;
+                    
+                    // Call the update_token_account_impl method
+                    let result = test_processor.update_token_account_impl(
+                        token_account.as_ref(),
+                        mint.as_ref(),
+                        owner.as_ref(),
+                        amount
+                    )?;
+                    
+                    Ok(jsonrpc_core::Value::String(result.to_string()))
+                });
+
+                let rp_clone3 = request_processor.clone();
+
+                io.add_sync_method("cloneAccountFromCluster", move |params: Params| {
+                    let param_array = params.parse::<Vec<serde_json::Value>>()?;
+                    if param_array.len() < 1 || param_array.len() > 2 {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "Expected 1 or 2 parameters: [address, (optional)url]"
+                        ));
+                    }
+                    
+                    // Parse the address
+                    let address_str = param_array[0].as_str().ok_or_else(|| {
+                        jsonrpc_core::Error::invalid_params("Address must be a string")
+                    })?;
+                    let address = address_str.parse::<Pubkey>().map_err(|err| {
+                        jsonrpc_core::Error::invalid_params(format!("Invalid address: {}", err))
+                    })?;
+                    
+                    // Parse the optional URL
+                    let url = if param_array.len() > 1 {
+                        param_array[1].as_str()
+                    } else {
+                        None
+                    };
+                    
+                    // Check if the processor is a test processor
+                    if !rp_clone3.is_test_processor() {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "cloneAccountFromCluster is only available in test validator mode"
+                        ));
+                    }
+                    
+                    // Downcast to TestValidatorJsonRpcRequestProcessor
+                    let test_processor = rp_clone3.as_any().downcast_ref::<TestValidatorJsonRpcRequestProcessor>()
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Failed to access test validator processor"))?;
+                    
+                    // Call the clone_account_from_cluster_impl method
+                    test_processor.clone_account_from_cluster_impl(&address, url)?;
+                    
+                    Ok(jsonrpc_core::Value::String(format!("Account {} cloned successfully", address)))
+                });
+
+                let rp_clone = request_processor.clone();
+
+                io.add_sync_method("setClock", move |params: Params| {
+                    let param_array = params.parse::<Vec<serde_json::Value>>()?;
+                    if param_array.len() < 2 || param_array.len() > 3 {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "Expected 2 or 3 parameters: [slot, unix_timestamp, (optional)epoch]"
+                        ));
+                    }
+                    
+                    // Parse the slot
+                    let slot = param_array[0].as_u64().ok_or_else(|| {
+                        jsonrpc_core::Error::invalid_params("Slot must be a positive integer")
+                    })?;
+                    
+                    // Parse the unix timestamp
+                    let unix_timestamp = param_array[1].as_i64().ok_or_else(|| {
+                        jsonrpc_core::Error::invalid_params("Unix timestamp must be an integer")
+                    })?;
+                    
+                    // Parse the optional epoch
+                    let epoch = if param_array.len() > 2 {
+                        Some(param_array[2].as_u64().ok_or_else(|| {
+                            jsonrpc_core::Error::invalid_params("Epoch must be a positive integer")
+                        })?)
+                    } else {
+                        None
+                    };
+                    
+                    // Check if the processor is a test processor
+                    if !rp_clone.is_test_processor() {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "setClock is only available in test validator mode"
+                        ));
+                    }
+                    
+                    // Downcast to TestValidatorJsonRpcRequestProcessor
+                    let test_processor = rp_clone.as_any().downcast_ref::<TestValidatorJsonRpcRequestProcessor>()
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Failed to access test validator processor"))?;
+                    
+                    // Call the set_clock method
+                    test_processor.set_clock(slot, unix_timestamp, epoch)
+                        .map_err(|err| jsonrpc_core::Error::invalid_params(format!("Failed to set clock: {}", err)))?;
+                    
+                    Ok(jsonrpc_core::Value::String(format!(
+                        "Clock updated to slot {}, unix_timestamp {}, epoch {}",
+                        slot, unix_timestamp, epoch.unwrap_or_else(|| test_processor.bank_forks.read().unwrap().working_bank().epoch_schedule().get_epoch(slot))
+                    )))
                 });
 
                 let request_middleware = RpcRequestMiddleware::new(
@@ -672,6 +882,14 @@ pub fn service_runtime(
             .expect("Runtime"),
     );
     runtime
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RpcTokenAccountRequest {
+    token_account: Option<Pubkey>,
+    mint: Option<Pubkey>,
+    owner: Option<Pubkey>,
+    amount: Option<u64>,
 }
 
 // #[cfg(test)]

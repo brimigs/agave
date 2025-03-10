@@ -184,7 +184,7 @@ fn main() {
     let parse_address = |address: &str, input_type: &str| {
         address
             .parse::<Pubkey>()
-            .or_else(|_| Ok(read_keypair_file(address).map(|keypair| keypair.pubkey())))
+            .or_else(|_| read_keypair_file(address).map(|keypair| keypair.pubkey()))
             .unwrap_or_else(|err| {
                 println!("Error: invalid {input_type} {address}: {err}");
                 exit(1);
