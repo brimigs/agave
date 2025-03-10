@@ -61,7 +61,7 @@ pub struct JsonRpcService {
     thread_hdl: JoinHandle<()>,
 
     #[cfg(test)]
-    pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
+    pub request_processor: RpcProcessorMetadata, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
 }
