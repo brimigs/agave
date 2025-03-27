@@ -1,4 +1,6 @@
 //! The `rpc` module implements the Solana RPC interface.
+use std::ops::{Deref, DerefMut};
+
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
 use {
@@ -155,6 +157,11 @@ fn is_finalized(
         && (blockstore.is_root(slot) || bank.status_cache_ancestors().contains(&slot))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProcessorType { 
+    Standard, 
+    Test,
+}
 #[derive(Debug, Clone)]
 pub struct JsonRpcConfig {
     pub enable_rpc_transaction_history: bool,
@@ -173,6 +180,7 @@ pub struct JsonRpcConfig {
     pub max_request_body_size: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
+    pub processor_type: ProcessorType, 
 }
 
 impl Default for JsonRpcConfig {
@@ -193,6 +201,7 @@ impl Default for JsonRpcConfig {
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
             disable_health_check: Default::default(),
+            processor_type: ProcessorType::Standard,
         }
     }
 }
@@ -2398,6 +2407,67 @@ impl JsonRpcRequestProcessor {
                 prioritization_fee,
             })
             .collect())
+    }
+}
+
+pub struct TestValidatorJsonRpcRequestProcessor {
+    pub base: JsonRpcRequestProcessor,
+}
+
+impl Deref for TestValidatorJsonRpcRequestProcessor {
+    type Target = JsonRpcRequestProcessor;
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+impl DerefMut for TestValidatorJsonRpcRequestProcessor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
+    }
+}
+
+impl TestValidatorJsonRpcRequestProcessor { 
+    pub fn get_base(&self) -> &JsonRpcRequestProcessor {
+        &self.base
+    }
+
+    pub fn clone_account_from_cluster(
+        &self,
+        address: &Pubkey,
+        url: Option<&str>,
+    ) -> Result<()> {
+        use solana_client::rpc_client::RpcClient;  
+        use solana_sdk::account::{ReadableAccount, WritableAccount};
+
+        // Default to mainnet-beta if no URL is provided
+        let url = url.unwrap_or("https://api.mainnet-beta.solana.com");
+
+        // Create a blocking client for simplicity
+        let client = RpcClient::new(url.to_string());
+
+        // Fetch the account data from the remote cluster
+        let account = client.get_account(address)
+            .map_err(|err| Error::invalid_params(format!(
+                "Failed to fetch account from {}: {}", url, err
+            )))?;
+
+        // Convert to AccountSharedData
+        let mut account_data = AccountSharedData::new(
+            account.lamports(),
+            account.data().len(),
+            account.owner(),
+        ); 
+        account_data.set_data(account.data().to_vec());
+        account_data.set_executable(account.executable());
+        account_data.set_rent_epoch(account.rent_epoch());
+
+        // Store the account in the test validator
+        let bank_forks = self.get_base().bank_forks.read().unwrap();
+        let bank = bank_forks.working_bank();
+        bank.store_account(address, &account_data);
+
+        Ok(())
     }
 }
 
