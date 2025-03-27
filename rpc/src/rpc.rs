@@ -160,7 +160,7 @@ fn is_finalized(
         && (blockstore.is_root(slot) || bank.status_cache_ancestors().contains(&slot))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProcessorType { 
     Standard, 
     Test,
@@ -204,7 +204,7 @@ impl Default for JsonRpcConfig {
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
             disable_health_check: Default::default(),
-            rpc_processor_type: Default::default(),
+            rpc_processor_type: Option::default(),
         }
     }
 }
@@ -249,6 +249,14 @@ pub trait RpcRequestProcessorTrait: Send + Sync {
     fn clone_without_bigtable(&self) -> Box<dyn RpcRequestProcessorTrait>;
     fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait>; 
     fn as_any(&self) -> &dyn std::any::Any;
+    fn clone_account_from_cluster(
+        &self,
+        address: &Pubkey,
+        url: Option<&str>,
+    ) -> Result<()>; 
+    fn set_account(&self, _address: &Pubkey, _account: &AccountSharedData) -> Result<()> {
+        Err(Error::invalid_params("set_account is only available in test validator mode"))
+    }
     async fn get_account_info(
         &self,
         pubkey: Pubkey,
@@ -1614,16 +1622,13 @@ pub struct JsonRpcRequestProcessor {
     runtime: Arc<Runtime>,
 }
 
-// #[derive(Clone)]
-// pub struct RpcProcessorMetadata {
-//     processor: Box<dyn RpcRequestProcessorTrait>,
-//     pub base: JsonRpcRequestProcessor,
-// }
-
-
 impl Metadata for JsonRpcRequestProcessor {}
 
 impl JsonRpcRequestProcessor {
+    pub fn get_config(&self) -> &JsonRpcConfig {
+        &self.config
+    }
+
     fn get_bank_with_config(&self, config: RpcContextConfig) -> Result<Arc<Bank>> {
         let RpcContextConfig {
             commitment,
@@ -2342,6 +2347,13 @@ impl RpcRequestProcessorTrait for JsonRpcRequestProcessor {
             ..self.clone()
         })
     }
+    fn clone_account_from_cluster(
+        &self,
+        _address: &Pubkey,
+        _url: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::invalid_params("clone_account_from_cluster is only available in test validator mode"))
+    }
     fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait> {
         Box::new(self.clone())
     }
@@ -2507,12 +2519,54 @@ impl RpcRequestProcessorTrait for TestValidatorJsonRpcRequestProcessor {
             ..self.base.clone()
         })
     }
-
     fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait> {
         Box::new(self.base.clone())
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+    fn set_account(&self, address: &Pubkey, account: &AccountSharedData) -> Result<()> {
+        let bank_forks = self.bank_forks.read().unwrap();
+        let bank = bank_forks.working_bank();
+        bank.store_account(address, account);
+        Ok(())
+    }
+    fn clone_account_from_cluster(
+        &self,
+        address: &Pubkey,
+        url: Option<&str>,
+    ) -> Result<()> {
+        use solana_client::rpc_client::RpcClient;  
+        use solana_sdk::account::{ReadableAccount, WritableAccount};
+
+        // Default to mainnet-beta if no URL is provided
+        let url = url.unwrap_or("https://api.mainnet-beta.solana.com");
+
+        // Create a blocking client for simplicity
+        let client = RpcClient::new(url.to_string());
+
+        // Fetch the account data from the remote cluster
+        let account = client.get_account(address)
+            .map_err(|err| Error::invalid_params(format!(
+                "Failed to fetch account from {}: {}", url, err
+            )))?;
+
+        // Convert to AccountSharedData
+        let mut account_data = AccountSharedData::new(
+            account.lamports(),
+            account.data().len(),
+            account.owner(),
+        ); 
+        account_data.set_data(account.data().to_vec());
+        account_data.set_executable(account.executable());
+        account_data.set_rent_epoch(account.rent_epoch());
+
+        // Store the account in the test validator
+        let bank_forks = self.bank_forks.read().unwrap();
+        let bank = bank_forks.working_bank();
+        bank.store_account(address, &account_data);
+
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     fn new(
