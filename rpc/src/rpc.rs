@@ -183,7 +183,7 @@ pub struct JsonRpcConfig {
     pub max_request_body_size: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
-    pub rpc_processor_type: Option<ProcessorType>, 
+    pub rpc_processor_type: ProcessorType, 
 }
 
 impl Default for JsonRpcConfig {
@@ -204,7 +204,7 @@ impl Default for JsonRpcConfig {
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
             disable_health_check: Default::default(),
-            rpc_processor_type: Option::default(),
+            rpc_processor_type: ProcessorType::Standard,
         }
     }
 }
@@ -214,6 +214,7 @@ impl JsonRpcConfig {
         Self {
             full_api: true,
             disable_health_check: true,
+            rpc_processor_type: ProcessorType::Test,
             ..Self::default()
         }
     }
@@ -1622,8 +1623,6 @@ pub struct JsonRpcRequestProcessor {
     runtime: Arc<Runtime>,
 }
 
-impl Metadata for JsonRpcRequestProcessor {}
-
 impl JsonRpcRequestProcessor {
     pub fn get_config(&self) -> &JsonRpcConfig {
         &self.config
@@ -2514,13 +2513,22 @@ impl RpcRequestProcessorTrait for TestValidatorJsonRpcRequestProcessor {
         &mut self.base
     }
     fn clone_without_bigtable(&self) -> Box<dyn RpcRequestProcessorTrait> {
-        Box::new(JsonRpcRequestProcessor {
+        let base_processor = JsonRpcRequestProcessor {
             bigtable_ledger_storage: None,
             ..self.base.clone()
+        };
+        Box::new(TestValidatorJsonRpcRequestProcessor {
+            base: base_processor,
         })
     }
     fn clone_box(&self) -> Box<dyn RpcRequestProcessorTrait> {
-        Box::new(self.base.clone())
+        let base_processor = JsonRpcRequestProcessor {
+            bigtable_ledger_storage: None,
+            ..self.base.clone()
+        };
+        Box::new(TestValidatorJsonRpcRequestProcessor {
+            base: base_processor,
+        })
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -2609,6 +2617,7 @@ impl RpcRequestProcessorTrait for TestValidatorJsonRpcRequestProcessor {
             prioritization_fee_cache,
             runtime,
         );
+
         (Self { base }, transaction_receiver)
     }
 
@@ -2633,6 +2642,36 @@ impl Deref for TestValidatorJsonRpcRequestProcessor {
 impl DerefMut for TestValidatorJsonRpcRequestProcessor {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.base
+    }
+}
+
+#[derive(Clone)]
+pub struct RpcProcessorMetadata {
+    processor: Box<dyn RpcRequestProcessorTrait>,
+    pub base: JsonRpcRequestProcessor,
+}
+
+impl RpcProcessorMetadata {
+    pub fn new(processor: Box<dyn RpcRequestProcessorTrait>, base: JsonRpcRequestProcessor) -> Self {
+        Self { processor, base }
+    }
+
+    pub fn processor(&self) -> &dyn RpcRequestProcessorTrait {
+        &*self.processor
+    }
+
+    pub fn get_base(&self) -> &JsonRpcRequestProcessor {
+        &self.base
+    }
+}
+
+impl Metadata for RpcProcessorMetadata {}
+
+impl Deref for RpcProcessorMetadata {
+    type Target = JsonRpcRequestProcessor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
     }
 }
 
@@ -3014,7 +3053,7 @@ pub mod rpc_minimal {
 
     pub struct MinimalImpl;
     impl Minimal for MinimalImpl {
-        type Metadata = JsonRpcRequestProcessor;
+        type Metadata = RpcProcessorMetadata;
 
         fn get_balance(
             &self,
@@ -3085,11 +3124,11 @@ pub mod rpc_minimal {
             }
 
             let (full_snapshot_archives_dir, incremental_snapshot_archives_dir) = meta
-                .snapshot_config
+                .snapshot_config.as_ref()
                 .map(|snapshot_config| {
                     (
-                        snapshot_config.full_snapshot_archives_dir,
-                        snapshot_config.incremental_snapshot_archives_dir,
+                        &snapshot_config.full_snapshot_archives_dir,
+                        &snapshot_config.incremental_snapshot_archives_dir,
                     )
                 })
                 .unwrap();
@@ -3230,7 +3269,7 @@ pub mod rpc_bank {
 
     pub struct BankDataImpl;
     impl BankData for BankDataImpl {
-        type Metadata = JsonRpcRequestProcessor;
+        type Metadata = RpcProcessorMetadata;
 
         fn get_minimum_balance_for_rent_exemption(
             &self,
@@ -3445,7 +3484,7 @@ pub mod rpc_accounts {
 
     pub struct AccountsDataImpl;
     impl AccountsData for AccountsDataImpl {
-        type Metadata = JsonRpcRequestProcessor;
+        type Metadata = RpcProcessorMetadata;
 
         fn get_account_info(
             &self,
@@ -3590,7 +3629,7 @@ pub mod rpc_accounts_scan {
 
     pub struct AccountsScanImpl;
     impl AccountsScan for AccountsScanImpl {
-        type Metadata = JsonRpcRequestProcessor;
+        type Metadata = RpcProcessorMetadata;
 
         fn get_program_accounts(
             &self,
@@ -3869,7 +3908,7 @@ pub mod rpc_full {
 
     pub struct FullImpl;
     impl Full for FullImpl {
-        type Metadata = JsonRpcRequestProcessor;
+        type Metadata = RpcProcessorMetadata;
 
         fn get_recent_performance_samples(
             &self,
@@ -4048,7 +4087,7 @@ pub mod rpc_full {
             };
 
             _send_transaction(
-                meta,
+                meta.base,
                 signature,
                 wire_transaction,
                 last_valid_block_height,
@@ -4169,7 +4208,7 @@ pub mod rpc_full {
             }
 
             _send_transaction(
-                meta,
+                meta.base,
                 signature,
                 wire_transaction,
                 last_valid_block_height,

@@ -465,9 +465,9 @@ fn main() {
         .deactivate_features(&features_to_deactivate);
 
     let rpc_processor_type = if matches.is_present("enable-test-features") {
-        Some(ProcessorType::Test)
+        ProcessorType::Test
     } else {
-        Some(ProcessorType::Standard)
+        ProcessorType::Standard
     };
 
     genesis.rpc_config(JsonRpcConfig {

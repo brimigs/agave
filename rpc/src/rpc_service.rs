@@ -678,10 +678,10 @@ impl JsonRpcService {
         let max_request_body_size = config
             .max_request_body_size
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
-        let processor_type = config.rpc_processor_type.clone().unwrap_or(ProcessorType::Standard);
+        let processor_type = config.rpc_processor_type.clone();
         let (request_processor, receiver) = match processor_type {
             ProcessorType::Standard => {
-                let (request_processor, receiver) = JsonRpcRequestProcessor::new(
+                let (processor, receiver) = JsonRpcRequestProcessor::new(
                     config,
                     snapshot_config.clone(),
                     bank_forks.clone(),
@@ -702,10 +702,10 @@ impl JsonRpcService {
                     Arc::clone(&runtime),
                 );
 
-                (Box::new(request_processor) as Box<dyn RpcRequestProcessorTrait>, receiver)
+                (Box::new(processor) as Box<dyn RpcRequestProcessorTrait>, receiver)
             }
             ProcessorType::Test => {
-                let (request_processor, receiver) = JsonRpcRequestProcessor::new(
+                let (base_processor, receiver) = JsonRpcRequestProcessor::new(
                     config,
                     snapshot_config.clone(),
                     bank_forks.clone(),
@@ -727,7 +727,7 @@ impl JsonRpcService {
                 );
 
                 let test_processor = TestValidatorJsonRpcRequestProcessor { 
-                    base: request_processor,
+                    base: base_processor,
                 }; 
 
                 (Box::new(test_processor) as Box<dyn RpcRequestProcessorTrait>, receiver)
@@ -830,16 +830,16 @@ impl JsonRpcService {
                     account.set_rent_epoch(rent_epoch);
                     account.set_data(account_data);
 
-                    if rp_clone.get_base().get_config().rpc_processor_type.ne(&Some(ProcessorType::Test)) {
+                    if rp_clone.get_base().get_config().rpc_processor_type.ne(&ProcessorType::Test) {
                         return Err(jsonrpc_core::Error::invalid_params(
                             "setAccount is only available in test validator mode"
                         ));
                     }
 
-                    // let test_processor = rp_clone.as_any().downcast_ref::<TestValidatorJsonRpcRequestProcessor>()
-                    //     .ok_or_else(|| jsonrpc_core::Error::invalid_params("Failed to access test validator processor"))?;
+                    let test_processor = rp_clone.as_any().downcast_ref::<TestValidatorJsonRpcRequestProcessor>()
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Failed to access test validator processor"))?;
 
-                    rp_clone.set_account(&address, &account)?;
+                    test_processor.set_account(&address, &account)?;
 
                     Ok(jsonrpc_core::Value::String(format!("Account {} updated successfully", address)))
                 });
@@ -869,14 +869,16 @@ impl JsonRpcService {
                         None
                     };
 
-                    // Check if the processor is a test processor
-                    if rp_clone3.get_base().get_config().rpc_processor_type.ne(&Some(ProcessorType::Test)) {
+                    if rp_clone3.get_base().get_config().rpc_processor_type.ne(&ProcessorType::Test) {
                         return Err(jsonrpc_core::Error::invalid_params(
                             "cloneAccountFromCluster is only available in test validator mode"
                         ));
                     }
+
+                    let test_processor = rp_clone3.as_any().downcast_ref::<TestValidatorJsonRpcRequestProcessor>()
+                    .ok_or_else(|| jsonrpc_core::Error::invalid_params("Failed to access test validator processor"))?;
             
-                    rp_clone3.clone_account_from_cluster(&address, url)?;
+                    test_processor.clone_account_from_cluster(&address, url)?;
 
                     Ok(jsonrpc_core::Value::String(format!("Account {} cloned successfully", address)))
                 });
@@ -890,16 +892,13 @@ impl JsonRpcService {
                 );
                 let server = ServerBuilder::with_meta_extractor(
                     io,
-                    move |req: &hyper::Request<hyper::Body>| {
+                     move |req: &hyper::Request<hyper::Body>| {
                         let xbigtable = req.headers().get("x-bigtable");
-                        let processor = if xbigtable.is_some_and(|v| v == "disabled") {
-                            request_processor.clone_without_bigtable()
+                        if xbigtable.is_some_and(|v| v == "disabled") {
+                            RpcProcessorMetadata::new(request_processor.clone_without_bigtable(), request_processor.clone_without_bigtable().get_base().clone())
                         } else {
-                            request_processor.clone()
-                        }; 
-                        processor.as_any().downcast_ref::<JsonRpcRequestProcessor>()
-                        .expect("Expected JsonRpcRequestProcessor")
-                        .clone()
+                            RpcProcessorMetadata::new(request_processor.clone(), request_processor.clone().get_base().clone())
+                        }
                     },
                 )
                 .event_loop_executor(runtime.handle().clone())
