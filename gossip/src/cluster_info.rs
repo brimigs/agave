@@ -42,7 +42,7 @@ use {
         },
         weighted_shuffle::WeightedShuffle,
     },
-    crossbeam_channel::{bounded, Receiver, SendError, Sender, TryRecvError, TrySendError},
+    crossbeam_channel::{Receiver, TrySendError},
     itertools::{Either, Itertools},
     rand::{seq::SliceRandom, CryptoRng, Rng},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
@@ -53,8 +53,9 @@ use {
     solana_net_utils::{
         bind_common_in_range_with_config, bind_common_with_config, bind_in_range,
         bind_in_range_with_config, bind_more_with_config, bind_to_localhost, bind_to_unspecified,
-        bind_two_in_range_with_offset_and_config, find_available_port_in_range,
-        multi_bind_in_range_with_config, PortRange, SocketConfig, VALIDATOR_PORT_RANGE,
+        bind_to_with_config, bind_two_in_range_with_offset_and_config,
+        find_available_port_in_range, multi_bind_in_range_with_config, PortRange, SocketConfig,
+        VALIDATOR_PORT_RANGE,
     },
     solana_perf::{
         data_budget::DataBudget,
@@ -135,9 +136,10 @@ const MIN_STAKE_FOR_GOSSIP: u64 = solana_native_token::LAMPORTS_PER_SOL;
 const MIN_NUM_STAKED_NODES: usize = 500;
 
 // Must have at least one socket to monitor the TVU port
-// The unsafes are safe because we're using fixed, known non-zero values
-pub const MINIMUM_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
-pub const DEFAULT_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(8) };
+pub const MINIMUM_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+pub const DEFAULT_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = MINIMUM_NUM_TVU_RECEIVE_SOCKETS;
+pub const MINIMUM_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+pub const DEFAULT_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(12).unwrap();
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ClusterInfoError {
@@ -204,75 +206,6 @@ fn should_retain_crds_value(
                 stake.unwrap_or_default() >= MIN_STAKE_FOR_GOSSIP
             }
         }
-    }
-}
-
-/// A sender implementation that evicts the oldest message when the channel is full.
-#[derive(Clone)]
-pub(crate) struct EvictingSender<T> {
-    sender: Sender<T>,
-    receiver: Receiver<T>,
-}
-
-impl<T> EvictingSender<T> {
-    /// Create a new evicting sender with provided sender, receiver.
-    #[inline]
-    pub(crate) fn new(sender: Sender<T>, receiver: Receiver<T>) -> Self {
-        Self { sender, receiver }
-    }
-
-    /// Create a new `EvictingSender` with a bounded channel of the specified capacity.
-    #[inline]
-    pub(crate) fn new_bounded(capacity: usize) -> (Self, Receiver<T>) {
-        let (sender, receiver) = bounded(capacity);
-        (Self::new(sender, receiver.clone()), receiver)
-    }
-}
-
-impl<T> ChannelSend<T> for EvictingSender<T>
-where
-    T: Send + 'static,
-{
-    #[inline]
-    fn send(&self, msg: T) -> std::result::Result<(), SendError<T>> {
-        self.sender.send(msg)
-    }
-
-    fn try_send(&self, msg: T) -> std::result::Result<(), TrySendError<T>> {
-        let Err(e) = self.sender.try_send(msg) else {
-            return Ok(());
-        };
-
-        match e {
-            // Prefer newer messages over older messages.
-            TrySendError::Full(msg) => match self.receiver.try_recv() {
-                Ok(older) => {
-                    // Attempt to requeue the newer message.
-                    // NB: if multiple senders are used, and another sender is faster than us to send() after we've popped `older`,
-                    // our try_send() will fail with Full(msg), in which case we drop the new message.
-                    self.sender.try_send(msg)?;
-                    // Propagate the error _with the older message_.
-                    Err(TrySendError::Full(older))
-                }
-                // Unlikely race condition -- it was just indicated that the channel is full.
-                // Attempt to requeue the message.
-                Err(TryRecvError::Empty) => self.sender.try_send(msg),
-                // Unreachable in practice since we maintain a reference to both the sender and receiver.
-                Err(TryRecvError::Disconnected) => unreachable!(),
-            },
-            // Unreachable in practice since we maintain a reference to both the sender and receiver.
-            TrySendError::Disconnected(_) => unreachable!(),
-        }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.receiver.is_empty()
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.receiver.len()
     }
 }
 
@@ -571,9 +504,7 @@ impl ClusterInfo {
                     .rpc()
                     .filter(|addr| self.socket_addr_space.check(addr))?;
                 let node_version = self.get_node_version(node.pubkey());
-                if my_shred_version != 0
-                    && (node.shred_version() != 0 && node.shred_version() != my_shred_version)
-                {
+                if node.shred_version() != 0 && node.shred_version() != my_shred_version {
                     return None;
                 }
                 let rpc_addr = node_rpc.ip();
@@ -628,7 +559,7 @@ impl ClusterInfo {
                 }
 
                 let node_version = self.get_node_version(node.pubkey());
-                if my_shred_version != 0 && (node.shred_version() != 0 && node.shred_version() != my_shred_version) {
+                if node.shred_version() != 0 && node.shred_version() != my_shred_version {
                     different_shred_nodes = different_shred_nodes.saturating_add(1);
                     None
                 } else {
@@ -1772,6 +1703,7 @@ impl ClusterInfo {
                         value, stakes, /*drop_unstaked_node_instance:*/ true,
                     )
                 },
+                self.my_shred_version(),
                 &self.stats,
             )
         };
@@ -2040,7 +1972,7 @@ impl ClusterInfo {
         let self_pubkey = self.id();
         // Filter out values if the shred-versions are different.
         let self_shred_version = self.my_shred_version();
-        if self_shred_version != 0 {
+        {
             let gossip_crds = self.gossip.crds.read().unwrap();
             let discard_different_shred_version = |msg| {
                 discard_different_shred_version(msg, self_shred_version, &gossip_crds, &self.stats)
@@ -2447,6 +2379,15 @@ pub struct Sockets {
     pub tpu_quic: Vec<UdpSocket>,
     pub tpu_forwards_quic: Vec<UdpSocket>,
     pub tpu_vote_quic: Vec<UdpSocket>,
+
+    /// Client-side socket for ForwardingStage
+    pub tpu_vote_forwards_client: UdpSocket,
+    /// Connection cache endpoint for Forwarding
+    pub quic_forwards_client: UdpSocket,
+    /// Connection cache endpoint for QUIC-based Vote
+    pub quic_vote_client: UdpSocket,
+    /// Client-side socket for RPC/SendTransactionService.
+    pub rpc_sts_client: UdpSocket,
 }
 
 pub struct NodeConfig {
@@ -2455,8 +2396,10 @@ pub struct NodeConfig {
     pub bind_ip_addr: IpAddr,
     pub public_tpu_addr: Option<SocketAddr>,
     pub public_tpu_forwards_addr: Option<SocketAddr>,
-    /// The number of TVU sockets to create
-    pub num_tvu_sockets: NonZeroUsize,
+    /// The number of TVU receive sockets to create
+    pub num_tvu_receive_sockets: NonZeroUsize,
+    /// The number of TVU retransmit sockets to create
+    pub num_tvu_retransmit_sockets: NonZeroUsize,
     /// The number of QUIC tpu endpoints
     pub num_quic_endpoints: NonZeroUsize,
 }
@@ -2529,6 +2472,11 @@ impl Node {
         let serve_repair_quic = bind_to_localhost().unwrap();
         let ancestor_hashes_requests = bind_to_unspecified().unwrap();
         let ancestor_hashes_requests_quic = bind_to_unspecified().unwrap();
+
+        let tpu_vote_forwards_client = bind_to_localhost().unwrap();
+        let quic_forwards_client = bind_to_localhost().unwrap();
+        let quic_vote_client = bind_to_localhost().unwrap();
+        let rpc_sts_client = bind_to_localhost().unwrap();
 
         let mut info = ContactInfo::new(
             *pubkey,
@@ -2606,6 +2554,10 @@ impl Node {
                 tpu_quic,
                 tpu_forwards_quic,
                 tpu_vote_quic,
+                tpu_vote_forwards_client,
+                quic_forwards_client,
+                quic_vote_client,
+                rpc_sts_client,
             },
         }
     }
@@ -2637,6 +2589,7 @@ impl Node {
         bind_in_range_with_config(bind_ip_addr, port_range, config).expect("Failed to bind")
     }
 
+    #[deprecated(since = "2.3.0", note = "Please use `new_with_external_ip` instead.")]
     pub fn new_single_bind(
         pubkey: &Pubkey,
         gossip_addr: &SocketAddr,
@@ -2708,6 +2661,12 @@ impl Node {
         let rpc_port = find_available_port_in_range(bind_ip_addr, port_range).unwrap();
         let rpc_pubsub_port = find_available_port_in_range(bind_ip_addr, port_range).unwrap();
 
+        // These are client sockets, so the port is set to be 0 because it must be ephimeral.
+        let tpu_vote_forwards_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
+        let quic_forwards_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
+        let quic_vote_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
+        let rpc_sts_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
+
         let addr = gossip_addr.ip();
         let mut info = ContactInfo::new(
             *pubkey,
@@ -2769,6 +2728,10 @@ impl Node {
                 tpu_quic,
                 tpu_forwards_quic,
                 tpu_vote_quic,
+                tpu_vote_forwards_client,
+                quic_vote_client,
+                quic_forwards_client,
+                rpc_sts_client,
             },
         }
     }
@@ -2780,7 +2743,8 @@ impl Node {
             bind_ip_addr,
             public_tpu_addr,
             public_tpu_forwards_addr,
-            num_tvu_sockets,
+            num_tvu_receive_sockets,
+            num_tvu_retransmit_sockets,
             num_quic_endpoints,
         } = config;
 
@@ -2794,7 +2758,7 @@ impl Node {
             bind_ip_addr,
             port_range,
             socket_config_reuseport,
-            num_tvu_sockets.get(),
+            num_tvu_receive_sockets.get(),
         )
         .expect("tvu multi_bind");
 
@@ -2838,8 +2802,7 @@ impl Node {
                 .expect("tpu_vote multi_bind");
 
         let (tpu_vote_quic_port, tpu_vote_quic) =
-            Self::bind_with_config(bind_ip_addr, port_range, socket_config);
-
+            Self::bind_with_config(bind_ip_addr, port_range, socket_config_reuseport);
         let tpu_vote_quic = bind_more_with_config(
             tpu_vote_quic,
             num_quic_endpoints.get(),
@@ -2847,9 +2810,13 @@ impl Node {
         )
         .unwrap();
 
-        let (_, retransmit_sockets) =
-            multi_bind_in_range_with_config(bind_ip_addr, port_range, socket_config_reuseport, 8)
-                .expect("retransmit multi_bind");
+        let (_, retransmit_sockets) = multi_bind_in_range_with_config(
+            bind_ip_addr,
+            port_range,
+            socket_config_reuseport,
+            num_tvu_retransmit_sockets.get(),
+        )
+        .expect("retransmit multi_bind");
 
         let (_, repair) = Self::bind_with_config(bind_ip_addr, port_range, socket_config);
         let (_, repair_quic) = Self::bind_with_config(bind_ip_addr, port_range, socket_config);
@@ -2867,6 +2834,12 @@ impl Node {
             Self::bind_with_config(bind_ip_addr, port_range, socket_config);
         let (_, ancestor_hashes_requests_quic) =
             Self::bind_with_config(bind_ip_addr, port_range, socket_config);
+
+        // These are client sockets, so the port is set to be 0 because it must be ephimeral.
+        let tpu_vote_forwards_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
+        let quic_forwards_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
+        let quic_vote_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
+        let rpc_sts_client = bind_to_with_config(bind_ip_addr, 0, socket_config).unwrap();
 
         let mut info = ContactInfo::new(
             *pubkey,
@@ -2892,30 +2865,32 @@ impl Node {
             .unwrap();
 
         trace!("new ContactInfo: {:?}", info);
-
-        Node {
-            info,
-            sockets: Sockets {
-                gossip,
-                tvu: tvu_sockets,
-                tvu_quic,
-                tpu: tpu_sockets,
-                tpu_forwards: tpu_forwards_sockets,
-                tpu_vote: tpu_vote_sockets,
-                broadcast,
-                repair,
-                repair_quic,
-                retransmit_sockets,
-                serve_repair,
-                serve_repair_quic,
-                ip_echo: Some(ip_echo),
-                ancestor_hashes_requests,
-                ancestor_hashes_requests_quic,
-                tpu_quic,
-                tpu_forwards_quic,
-                tpu_vote_quic,
-            },
-        }
+        let sockets = Sockets {
+            gossip,
+            tvu: tvu_sockets,
+            tvu_quic,
+            tpu: tpu_sockets,
+            tpu_forwards: tpu_forwards_sockets,
+            tpu_vote: tpu_vote_sockets,
+            broadcast,
+            repair,
+            repair_quic,
+            retransmit_sockets,
+            serve_repair,
+            serve_repair_quic,
+            ip_echo: Some(ip_echo),
+            ancestor_hashes_requests,
+            ancestor_hashes_requests_quic,
+            tpu_quic,
+            tpu_forwards_quic,
+            tpu_vote_quic,
+            tpu_vote_forwards_client,
+            quic_vote_client,
+            quic_forwards_client,
+            rpc_sts_client,
+        };
+        info!("Bound all network sockets as follows: {:#?}", &sockets);
+        Node { info, sockets }
     }
 }
 
@@ -3385,7 +3360,8 @@ mod tests {
             bind_ip_addr: IpAddr::V4(ip),
             public_tpu_addr: None,
             public_tpu_forwards_addr: None,
-            num_tvu_sockets: MINIMUM_NUM_TVU_SOCKETS,
+            num_tvu_receive_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
+            num_tvu_retransmit_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
             num_quic_endpoints: DEFAULT_NUM_QUIC_ENDPOINTS,
         };
 
@@ -3408,7 +3384,8 @@ mod tests {
             bind_ip_addr: ip,
             public_tpu_addr: None,
             public_tpu_forwards_addr: None,
-            num_tvu_sockets: MINIMUM_NUM_TVU_SOCKETS,
+            num_tvu_receive_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
+            num_tvu_retransmit_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
             num_quic_endpoints: DEFAULT_NUM_QUIC_ENDPOINTS,
         };
 

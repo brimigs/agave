@@ -252,7 +252,6 @@ fn test_local_cluster_signature_subscribe() {
         &[&cluster.funding_keypair],
         &mut transaction,
         5,
-        0,
     )
     .unwrap();
 
@@ -436,7 +435,6 @@ fn test_mainnet_beta_cluster_type() {
 
     // Programs that are available at epoch 0
     for program_id in [
-        &solana_config_program::id(),
         &solana_sdk::system_program::id(),
         &solana_sdk::stake::program::id(),
         &solana_vote_program::id(),
@@ -1277,7 +1275,7 @@ fn test_snapshot_restart_tower() {
     cluster_tests::spend_and_verify_all_nodes(
         restarted_node_info,
         &cluster.funding_keypair,
-        1,
+        2,
         HashSet::new(),
         SocketAddrSpace::Unspecified,
         &cluster.connection_cache,
@@ -2846,7 +2844,6 @@ fn test_oc_bad_signatures() {
                     &[&cluster_funding_keypair, &bad_authorized_signer_keypair],
                     &mut vote_tx,
                     5,
-                    0,
                 )
                 .unwrap();
 

@@ -17,7 +17,7 @@ use {
             VerifiedVoteSender, VoteTracker,
         },
         fetch_stage::FetchStage,
-        forwarding_stage::ForwardingStage,
+        forwarding_stage::{spawn_forwarding_stage, ForwardAddressGetter},
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
@@ -71,6 +71,8 @@ pub struct TpuSockets {
     pub transactions_quic: Vec<UdpSocket>,
     pub transactions_forwards_quic: Vec<UdpSocket>,
     pub vote_quic: Vec<UdpSocket>,
+    /// Client-side socket for the forwarding votes.
+    pub vote_forwards_client: UdpSocket,
 }
 
 pub struct Tpu {
@@ -140,6 +142,7 @@ impl Tpu {
             transactions_quic: transactions_quic_sockets,
             transactions_forwards_quic: transactions_forwards_quic_sockets,
             vote_quic: tpu_vote_quic_sockets,
+            vote_forwards_client: vote_forwards_client_socket,
         } = sockets;
 
         let (packet_sender, packet_receiver) = unbounded();
@@ -280,11 +283,12 @@ impl Tpu {
             prioritization_fee_cache,
         );
 
-        let forwarding_stage = ForwardingStage::spawn(
+        let forwarding_stage = spawn_forwarding_stage(
             forward_stage_receiver,
             connection_cache.clone(),
+            vote_forwards_client_socket,
             RootBankCache::new(bank_forks.clone()),
-            (cluster_info.clone(), poh_recorder.clone()),
+            ForwardAddressGetter::new(cluster_info.clone(), poh_recorder.clone()),
             DataBudget::default(),
         );
 

@@ -39,7 +39,9 @@ use {
     solana_compute_budget::{
         compute_budget::ComputeBudget, compute_budget_limits::ComputeBudgetLimits,
     },
-    solana_cost_model::block_cost_limits::{MAX_BLOCK_UNITS, MAX_BLOCK_UNITS_SIMD_0207},
+    solana_cost_model::block_cost_limits::{
+        MAX_BLOCK_UNITS, MAX_BLOCK_UNITS_SIMD_0207, MAX_BLOCK_UNITS_SIMD_0256,
+    },
     solana_inline_spl::token,
     solana_logger,
     solana_program_runtime::{
@@ -158,7 +160,6 @@ impl VoteReward {
             vote_account: validator_vote_account,
             commission: rng.gen_range(1..20),
             vote_rewards: rng.gen_range(1..200),
-            vote_needs_store: rng.gen_range(1..20) > 10,
         }
     }
 }
@@ -3517,7 +3518,7 @@ fn test_bank_hash_internal_state(is_accounts_lt_hash_enabled: bool) {
     bank2.transfer(amount, &mint_keypair, &pubkey2).unwrap();
     bank2.squash();
     bank2.force_flush_accounts_cache();
-    bank2.update_accounts_hash(CalcAccountsHashDataSource::Storages, false, false);
+    bank2.update_accounts_hash(CalcAccountsHashDataSource::Storages, false);
     assert!(bank2.verify_accounts_hash(None, VerifyAccountsHashConfig::default_for_test(), None,));
 }
 
@@ -6514,26 +6515,26 @@ fn test_bank_hash_consistency() {
         if bank.slot == 0 {
             assert_eq!(
                 bank.hash().to_string(),
-                "Hn2FoJuoFWXVFVnwcQ6peuT24mUPmhDtXHXVjKD7M4yP",
+                "5b72TRrdMhGED3boghe55CyX8hmnpYt7RTMrwrHTrNpP",
             );
         }
 
         if bank.slot == 32 {
             assert_eq!(
                 bank.hash().to_string(),
-                "Hdrk5wqzRZbofSgZMC3ztfNimrFu6DeYp751JWvtabo"
+                "2k9XFkra1XyobQb4Z73xSEgFsUdp87cmftYfWEpXQoah"
             );
         }
         if bank.slot == 64 {
             assert_eq!(
                 bank.hash().to_string(),
-                "4EcAFkTxymwwPGeCgadhkrkg2hqfAPzuQZoN2NFqPzyg"
+                "GpePwzXm6nomkj9CKPU4qwvrFnBcjYRrs3hSoRgHN5CP"
             );
         }
         if bank.slot == 128 {
             assert_eq!(
                 bank.hash().to_string(),
-                "4BK3VANr5mhyRyrwbUHYb2kmM5m76PBGkhmKMrQ2aq7L"
+                "8GjxSMXwRe7AyFZoF9R7XVcTC5wYoVKvdawU8ysRcBid"
             );
             break;
         }
@@ -6752,7 +6753,7 @@ fn test_shrink_candidate_slots_cached() {
     // No more slots should be shrunk
     assert_eq!(bank2.shrink_candidate_slots(), 0);
     // alive_counts represents the count of alive accounts in the three slots 0,1,2
-    assert_eq!(alive_counts, vec![15, 1, 6]);
+    assert_eq!(alive_counts, vec![13, 1, 6]);
 }
 
 #[test]
@@ -8043,9 +8044,14 @@ fn test_reserved_account_keys() {
 fn test_block_limits() {
     let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
     let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+
+    // Ensure increased block limits features are inactive.
     assert!(!bank
         .feature_set
         .is_active(&feature_set::raise_block_limits_to_50m::id()));
+    assert!(!bank
+        .feature_set
+        .is_active(&feature_set::raise_block_limits_to_60m::id()));
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_block_limit(),
         MAX_BLOCK_UNITS,
@@ -8074,10 +8080,39 @@ fn test_block_limits() {
     );
 
     // Make sure the limits propagate to the child-bank.
-    let bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), 2);
+    let mut bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), 2);
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_block_limit(),
         MAX_BLOCK_UNITS_SIMD_0207,
+        "child bank should have new limit"
+    );
+
+    // Activate `raise_block_limits_to_60m` feature
+    bank.store_account(
+        &feature_set::raise_block_limits_to_60m::id(),
+        &feature::create_account(&Feature::default(), 42),
+    );
+    // apply_feature_activations for `FinishInit` will not cause the block limit to be updated
+    bank.apply_feature_activations(ApplyFeatureActivationsCaller::FinishInit, true);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0207,
+        "before activating the feature, bank should have old/default limit"
+    );
+
+    // apply_feature_activations for `NewFromParent` will cause feature to be activated
+    bank.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, true);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "after activating the feature, bank should have new limit"
+    );
+
+    // Make sure the limits propagate to the child-bank.
+    let bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), 3);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
         "child bank should have new limit"
     );
 
@@ -8103,6 +8138,162 @@ fn test_block_limits() {
         bank.read_cost_tracker().unwrap().get_block_limit(),
         MAX_BLOCK_UNITS_SIMD_0207,
         "bank created from genesis config should have new limit"
+    );
+
+    activate_feature(
+        &mut genesis_config,
+        feature_set::raise_block_limits_to_60m::id(),
+    );
+    let bank = Bank::new_for_tests(&genesis_config);
+    assert!(bank
+        .feature_set
+        .is_active(&feature_set::raise_block_limits_to_60m::id()));
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "bank created from genesis config should have new limit"
+    );
+}
+
+#[test]
+fn test_block_limits_feature_dual_activation() {
+    let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
+    let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+
+    // Ensure increased block limits features are inactive.
+    assert!(!bank
+        .feature_set
+        .is_active(&feature_set::raise_block_limits_to_50m::id()));
+    assert!(!bank
+        .feature_set
+        .is_active(&feature_set::raise_block_limits_to_60m::id()));
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS,
+        "before activating the feature, bank should have old/default limit"
+    );
+
+    // Activate `raise_block_limits_to_50m` feature
+    bank.store_account(
+        &feature_set::raise_block_limits_to_50m::id(),
+        &feature::create_account(&Feature::default(), 42),
+    );
+
+    // Activate `raise_block_limits_to_60m` feature
+    bank.store_account(
+        &feature_set::raise_block_limits_to_60m::id(),
+        &feature::create_account(&Feature::default(), 42),
+    );
+
+    // apply_feature_activations for `NewFromParent` will cause `raise_block_limits_to_60m` to be activated
+    bank.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, true);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "after activating the feature, bank should have newest limit"
+    );
+
+    // Make sure the limits propagate to the child-bank.
+    let bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), 2);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "child bank should have newest limit"
+    );
+
+    // Test starting from a genesis config with and without feature account
+    let (mut genesis_config, _keypair) = create_genesis_config(100_000);
+    // Without feature account in genesis, old limits are used.
+    let bank = Bank::new_for_tests(&genesis_config);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS,
+        "before activating the feature, bank should have old/default limit"
+    );
+
+    // Activate `raise_block_limits_to_50m` feature
+    activate_feature(
+        &mut genesis_config,
+        feature_set::raise_block_limits_to_50m::id(),
+    );
+    // Activate `raise_block_limits_to_60m` feature
+    activate_feature(
+        &mut genesis_config,
+        feature_set::raise_block_limits_to_60m::id(),
+    );
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    // `raise_block_limits_to_60m` feature and block limits should be active.
+    assert!(bank
+        .feature_set
+        .is_active(&feature_set::raise_block_limits_to_60m::id()));
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "bank created from genesis config should have newest limit"
+    );
+}
+
+#[test]
+fn test_block_limits_feature_reverse_order() {
+    let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
+    let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+
+    // Ensure increased block limits features are inactive.
+    assert!(!bank
+        .feature_set
+        .is_active(&feature_set::raise_block_limits_to_50m::id()));
+    assert!(!bank
+        .feature_set
+        .is_active(&feature_set::raise_block_limits_to_60m::id()));
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS,
+        "before activating the feature, bank should have old/default limit"
+    );
+
+    // Activate `raise_block_limits_to_60m` feature
+    bank.store_account(
+        &feature_set::raise_block_limits_to_60m::id(),
+        &feature::create_account(&Feature::default(), 42),
+    );
+
+    // apply_feature_activations for `NewFromParent` will cause `raise_block_limits_to_60m` to be activated
+    bank.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, true);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "after activating the feature, bank should have new limit"
+    );
+
+    // Make sure the limits propagate to the child-bank.
+    let mut bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), 2);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "child bank should have new limit"
+    );
+
+    // "Activate" `raise_block_limits_to_50m` feature
+    bank.store_account(
+        &feature_set::raise_block_limits_to_50m::id(),
+        &feature::create_account(&Feature::default(), 42),
+    );
+
+    // apply_feature_activations for `NewFromParent`
+    bank.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, true);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "bank should keep the same limit"
+    );
+
+    // Make sure the SIMD-0256 limits are still in place as they take precedence over the SIMD-0207 limits.
+    let bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), 3);
+    assert_eq!(
+        bank.read_cost_tracker().unwrap().get_block_limit(),
+        MAX_BLOCK_UNITS_SIMD_0256,
+        "child bank should keep the same limit"
     );
 }
 
@@ -12444,7 +12635,7 @@ fn test_bank_verify_accounts_hash_with_base() {
     // update the base accounts hash
     bank.squash();
     bank.force_flush_accounts_cache();
-    bank.update_accounts_hash(CalcAccountsHashDataSource::Storages, false, false);
+    bank.update_accounts_hash(CalcAccountsHashDataSource::Storages, false);
     let base_slot = bank.slot();
     let base_capitalization = bank.capitalization();
 
@@ -12765,7 +12956,6 @@ fn test_calc_vote_accounts_to_store_overflow() {
             vote_account,
             commission: 0,
             vote_rewards: 1, // enough to overflow
-            vote_needs_store: false,
         },
     );
     let result = Bank::calc_vote_accounts_to_store(vote_account_rewards);
@@ -12774,96 +12964,38 @@ fn test_calc_vote_accounts_to_store_overflow() {
 }
 
 #[test]
-fn test_calc_vote_accounts_to_store_three() {
-    let vote_account_rewards = DashMap::default();
-    let pubkey = solana_pubkey::new_rand();
-    let pubkey2 = solana_pubkey::new_rand();
-    let pubkey3 = solana_pubkey::new_rand();
-    let mut vote_account = AccountSharedData::default();
-    vote_account.set_lamports(u64::MAX);
-    vote_account_rewards.insert(
-        pubkey,
-        VoteReward {
-            vote_account: vote_account.clone(),
-            commission: 0,
-            vote_rewards: 0,
-            vote_needs_store: false, // don't store
-        },
-    );
-    vote_account_rewards.insert(
-        pubkey2,
-        VoteReward {
-            vote_account: vote_account.clone(),
-            commission: 0,
-            vote_rewards: 0,
-            vote_needs_store: true, // this one needs storing
-        },
-    );
-    vote_account_rewards.insert(
-        pubkey3,
-        VoteReward {
-            vote_account: vote_account.clone(),
-            commission: 0,
-            vote_rewards: 0,
-            vote_needs_store: false, // don't store
-        },
-    );
-    let result = Bank::calc_vote_accounts_to_store(vote_account_rewards);
-    assert_eq!(result.rewards.len(), result.accounts_to_store.len());
-    assert_eq!(result.rewards.len(), 3);
-    result.rewards.iter().enumerate().for_each(|(i, (k, _))| {
-        // pubkey2 is some(account), others should be none
-        if k == &pubkey2 {
-            assert!(accounts_equal(
-                result.accounts_to_store[i].as_ref().unwrap(),
-                &vote_account
-            ));
-        } else {
-            assert!(result.accounts_to_store[i].is_none());
-        }
-    });
-}
-
-#[test]
 fn test_calc_vote_accounts_to_store_normal() {
     let pubkey = solana_pubkey::new_rand();
     for commission in 0..2 {
         for vote_rewards in 0..2 {
-            for vote_needs_store in [false, true] {
-                let vote_account_rewards = DashMap::default();
-                let mut vote_account = AccountSharedData::default();
-                vote_account.set_lamports(1);
-                vote_account_rewards.insert(
-                    pubkey,
-                    VoteReward {
-                        vote_account: vote_account.clone(),
-                        commission,
-                        vote_rewards,
-                        vote_needs_store,
-                    },
-                );
-                let result = Bank::calc_vote_accounts_to_store(vote_account_rewards);
-                assert_eq!(result.rewards.len(), result.accounts_to_store.len());
-                assert_eq!(result.rewards.len(), 1);
-                let rewards = &result.rewards[0];
-                let account = &result.accounts_to_store[0];
-                _ = vote_account.checked_add_lamports(vote_rewards);
-                if vote_needs_store {
-                    assert!(accounts_equal(account.as_ref().unwrap(), &vote_account));
-                } else {
-                    assert!(account.is_none());
+            let vote_account_rewards = DashMap::default();
+            let mut vote_account = AccountSharedData::default();
+            vote_account.set_lamports(1);
+            vote_account_rewards.insert(
+                pubkey,
+                VoteReward {
+                    vote_account: vote_account.clone(),
+                    commission,
+                    vote_rewards,
+                },
+            );
+            let result = Bank::calc_vote_accounts_to_store(vote_account_rewards);
+            assert_eq!(result.rewards.len(), result.accounts_to_store.len());
+            assert_eq!(result.rewards.len(), 1);
+            let rewards = &result.rewards[0];
+            let account = &result.accounts_to_store[0].1;
+            _ = vote_account.checked_add_lamports(vote_rewards);
+            assert!(accounts_equal(account, &vote_account));
+            assert_eq!(
+                rewards.1,
+                RewardInfo {
+                    reward_type: RewardType::Voting,
+                    lamports: vote_rewards as i64,
+                    post_balance: vote_account.lamports(),
+                    commission: Some(commission),
                 }
-                assert_eq!(
-                    rewards.1,
-                    RewardInfo {
-                        reward_type: RewardType::Voting,
-                        lamports: vote_rewards as i64,
-                        post_balance: vote_account.lamports(),
-                        commission: Some(commission),
-                    }
-                );
-                assert_eq!(rewards.0, pubkey);
-            }
+            );
+            assert_eq!(rewards.0, pubkey);
         }
     }
 }
@@ -13501,11 +13633,14 @@ fn test_loader_v3_to_v4_migration() {
         .unwrap()
         .copy_from_slice(&elf);
     let message = Message::new(
-        &[solana_loader_v3_interface::instruction::migrate_program(
-            &programdata_address,
-            &program_keypair.pubkey(),
-            &program_keypair.pubkey(),
-        )],
+        &[
+            solana_loader_v3_interface::instruction::migrate_program(
+                &programdata_address,
+                &program_keypair.pubkey(),
+                &program_keypair.pubkey(),
+            ),
+            ComputeBudgetInstruction::set_compute_unit_limit(12_000),
+        ],
         Some(&payer_keypair.pubkey()),
     );
     let signers = &[&payer_keypair, &program_keypair];
@@ -13532,11 +13667,14 @@ fn test_loader_v3_to_v4_migration() {
         .unwrap()
         .copy_from_slice(&elf);
     let message = Message::new(
-        &[solana_loader_v3_interface::instruction::migrate_program(
-            &programdata_address,
-            &program_keypair.pubkey(),
-            &upgrade_authority_keypair.pubkey(),
-        )],
+        &[
+            solana_loader_v3_interface::instruction::migrate_program(
+                &programdata_address,
+                &program_keypair.pubkey(),
+                &upgrade_authority_keypair.pubkey(),
+            ),
+            ComputeBudgetInstruction::set_compute_unit_limit(10_000),
+        ],
         Some(&payer_keypair.pubkey()),
     );
     let signers = &[&payer_keypair, &upgrade_authority_keypair];

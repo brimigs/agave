@@ -1,7 +1,4 @@
 use {
-    agave_precompiles::get_precompile,
-    solana_account::WritableAccount,
-    solana_instructions_sysvar as instructions,
     solana_measure::measure_us,
     solana_program_runtime::invoke_context::InvokeContext,
     solana_svm_transaction::svm_message::SVMMessage,
@@ -23,28 +20,11 @@ pub(crate) fn process_message(
     accumulated_consumed_units: &mut u64,
 ) -> Result<(), TransactionError> {
     debug_assert_eq!(program_indices.len(), message.num_instructions());
-    for (instruction_index, ((program_id, instruction), program_indices)) in message
+    for (top_level_instruction_index, ((program_id, instruction), program_indices)) in message
         .program_instructions_iter()
         .zip(program_indices.iter())
         .enumerate()
     {
-        // Fixup the special instructions key if present
-        // before the account pre-values are taken care of
-        if let Some(account_index) = invoke_context
-            .transaction_context
-            .find_index_of_account(&instructions::id())
-        {
-            let mut mut_account_ref = invoke_context
-                .transaction_context
-                .accounts()
-                .try_borrow_mut(account_index)
-                .map_err(|_| TransactionError::InvalidAccountIndex)?;
-            instructions::store_current_index(
-                mut_account_ref.data_as_mut_slice(),
-                instruction_index as u16,
-            );
-        }
-
         let mut instruction_accounts = Vec::with_capacity(instruction.accounts.len());
         for (instruction_account_index, index_in_transaction) in
             instruction.accounts.iter().enumerate()
@@ -69,11 +49,9 @@ pub(crate) fn process_message(
 
         let mut compute_units_consumed = 0;
         let (result, process_instruction_us) = measure_us!({
-            if let Some(precompile) = get_precompile(program_id, |feature_id| {
-                invoke_context.get_feature_set().is_active(feature_id)
-            }) {
+            if invoke_context.is_precompile(program_id) {
                 invoke_context.process_precompile(
-                    precompile,
+                    program_id,
                     instruction.data,
                     &instruction_accounts,
                     program_indices,
@@ -107,7 +85,9 @@ pub(crate) fn process_message(
             .process_instructions
             .total_us += process_instruction_us;
 
-        result.map_err(|err| TransactionError::InstructionError(instruction_index as u8, err))?;
+        result.map_err(|err| {
+            TransactionError::InstructionError(top_level_instruction_index as u8, err)
+        })?;
     }
     Ok(())
 }
@@ -124,12 +104,14 @@ mod tests {
         },
         rand0_7::thread_rng,
         solana_account::{
-            Account, AccountSharedData, ReadableAccount, DUMMY_INHERITABLE_ACCOUNT_FIELDS,
+            Account, AccountSharedData, ReadableAccount, WritableAccount,
+            DUMMY_INHERITABLE_ACCOUNT_FIELDS,
         },
         solana_ed25519_program::new_ed25519_instruction,
         solana_hash::Hash,
         solana_instruction::{error::InstructionError, AccountMeta, Instruction},
         solana_message::{AccountKeys, Message, SanitizedMessage},
+        solana_precompile_error::PrecompileError,
         solana_program_runtime::{
             declare_process_instruction,
             execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
@@ -142,9 +124,13 @@ mod tests {
         solana_sdk_ids::{ed25519_program, native_loader, secp256k1_program, system_program},
         solana_secp256k1_program::new_secp256k1_instruction,
         solana_secp256r1_program::new_secp256r1_instruction,
+        solana_svm_callback::InvokeContextCallback,
         solana_transaction_context::TransactionContext,
         std::sync::Arc,
     };
+
+    struct MockCallback {}
+    impl InvokeContextCallback for MockCallback {}
 
     fn create_loadable_account_for_test(name: &str) -> AccountSharedData {
         let (lamports, rent_epoch) = DUMMY_INHERITABLE_ACCOUNT_FIELDS;
@@ -254,8 +240,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
-            0,
-            &|_| 0,
+            &MockCallback {},
             Arc::new(FeatureSet::all_enabled()),
             &sysvar_cache,
         );
@@ -309,8 +294,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
-            0,
-            &|_| 0,
+            &MockCallback {},
             Arc::new(FeatureSet::all_enabled()),
             &sysvar_cache,
         );
@@ -354,8 +338,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
-            0,
-            &|_| 0,
+            &MockCallback {},
             Arc::new(FeatureSet::all_enabled()),
             &sysvar_cache,
         );
@@ -490,8 +473,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
-            0,
-            &|_| 0,
+            &MockCallback {},
             Arc::new(FeatureSet::all_enabled()),
             &sysvar_cache,
         );
@@ -530,8 +512,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
-            0,
-            &|_| 0,
+            &MockCallback {},
             Arc::new(FeatureSet::all_enabled()),
             &sysvar_cache,
         );
@@ -567,8 +548,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
-            0,
-            &|_| 0,
+            &MockCallback {},
             Arc::new(FeatureSet::all_enabled()),
             &sysvar_cache,
         );
@@ -668,11 +648,33 @@ mod tests {
             mock_program_id,
             Arc::new(ProgramCacheEntry::new_builtin(0, 0, MockBuiltin::vm)),
         );
+
+        struct MockCallback {}
+        impl InvokeContextCallback for MockCallback {
+            fn is_precompile(&self, program_id: &Pubkey) -> bool {
+                program_id == &secp256k1_program::id()
+                    || program_id == &ed25519_program::id()
+                    || program_id == &solana_secp256r1_program::id()
+            }
+
+            fn process_precompile(
+                &self,
+                program_id: &Pubkey,
+                _data: &[u8],
+                _instruction_datas: Vec<&[u8]>,
+            ) -> std::result::Result<(), PrecompileError> {
+                if self.is_precompile(program_id) {
+                    Ok(())
+                } else {
+                    Err(PrecompileError::InvalidPublicKey)
+                }
+            }
+        }
+
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
-            0,
-            &|_| 0,
+            &MockCallback {},
             Arc::new(FeatureSet::all_enabled()),
             &sysvar_cache,
         );

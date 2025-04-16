@@ -5,7 +5,7 @@ use {
     itertools::Itertools,
     log::*,
     solana_core::{
-        banking_stage::unified_scheduler::ensure_banking_stage_setup,
+        banking_stage::{unified_scheduler::ensure_banking_stage_setup, BankingStage},
         banking_trace::BankingTracer,
         consensus::{
             heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
@@ -251,6 +251,7 @@ fn test_scheduler_producing_blocks() {
         &cluster_info,
         &poh_recorder,
         transaction_recorder,
+        BankingStage::num_threads(),
     );
     bank_forks.write().unwrap().install_scheduler_pool(pool);
 
@@ -279,6 +280,7 @@ fn test_scheduler_producing_blocks() {
         .write()
         .unwrap()
         .set_bank(tpu_bank.clone_with_scheduler(), false);
+    tpu_bank.unpause_new_block_production_scheduler();
     let tpu_bank = bank_forks.read().unwrap().working_bank_with_scheduler();
     assert_eq!(tpu_bank.transaction_count(), 0);
 

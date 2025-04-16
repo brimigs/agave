@@ -45,6 +45,7 @@ use {
     },
     solana_metrics::inc_new_counter_info,
     solana_perf::packet::PACKET_DATA_SIZE,
+    solana_program_pack::Pack,
     solana_rpc_client_api::{
         config::*,
         custom_error::RpcCustomError,
@@ -103,7 +104,6 @@ use {
             interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
             BaseStateWithExtensions, StateWithExtensions,
         },
-        solana_program::program_pack::Pack,
         state::{Account as TokenAccount, Mint},
     },
     std::{
@@ -4696,6 +4696,13 @@ pub mod tests {
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path,
         },
+        solana_log_collector::ic_logger_msg,
+        solana_program_option::COption,
+        solana_program_runtime::{
+            invoke_context::InvokeContext,
+            loaded_programs::ProgramCacheEntry,
+            solana_sbpf::{declare_builtin_function, memory_region::MemoryMapping},
+        },
         solana_rpc_client_api::{
             custom_error::{
                 JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
@@ -4719,7 +4726,7 @@ pub mod tests {
             compute_budget::ComputeBudgetInstruction,
             fee_calculator::FeeRateGovernor,
             hash::{hash, Hash},
-            instruction::InstructionError,
+            instruction::{AccountMeta, Instruction, InstructionError},
             message::{
                 v0::{self, MessageAddressTableLookup},
                 Message, MessageHeader, VersionedMessage,
@@ -4751,7 +4758,6 @@ pub mod tests {
                 mint_close_authority::MintCloseAuthority, BaseStateWithExtensionsMut,
                 ExtensionType, StateWithExtensionsMut,
             },
-            solana_program::{program_option::COption, pubkey::Pubkey as SplTokenPubkey},
             state::{AccountState as TokenAccountState, Mint},
         },
         std::{borrow::Cow, collections::HashMap, net::Ipv4Addr},
@@ -4803,6 +4809,103 @@ pub mod tests {
             }
         } else {
             panic!("Expected single response");
+        }
+    }
+
+    fn test_builtin_processor(
+        invoke_context: &mut InvokeContext,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+        let log_collector = invoke_context.get_log_collector();
+        invoke_context.consume_checked(TestBuiltinEntrypoint::COMPUTE_UNITS)?;
+
+        let transaction_context = &invoke_context.transaction_context;
+        let instruction_context = transaction_context.get_current_instruction_context()?;
+
+        let instruction_data = instruction_context.get_instruction_data();
+        let (lamports, space) = {
+            let (l_bytes, s_bytes) = instruction_data.split_at(8);
+            let lamports = u64::from_le_bytes(l_bytes.try_into().unwrap());
+            let space = u64::from_le_bytes(s_bytes.try_into().unwrap());
+            (lamports, space)
+        };
+
+        ic_logger_msg!(log_collector, "I am logging from a builtin program!");
+        ic_logger_msg!(log_collector, "I am about to CPI to System!");
+
+        let from_pubkey = *transaction_context.get_key_of_account_at_index(
+            instruction_context.get_index_of_instruction_account_in_transaction(0)?,
+        )?;
+        let to_pubkey = *transaction_context.get_key_of_account_at_index(
+            instruction_context.get_index_of_instruction_account_in_transaction(1)?,
+        )?;
+        let owner_pubkey = *transaction_context.get_key_of_account_at_index(
+            instruction_context.get_index_of_instruction_account_in_transaction(2)?,
+        )?;
+
+        invoke_context.native_invoke(
+            system_instruction::create_account(
+                &from_pubkey,
+                &to_pubkey,
+                lamports,
+                space,
+                &owner_pubkey,
+            )
+            .into(),
+            &[],
+        )?;
+
+        ic_logger_msg!(log_collector, "All done!");
+        Ok(0)
+    }
+
+    declare_builtin_function!(
+        TestBuiltinEntrypoint,
+        fn rust(
+            invoke_context: &mut InvokeContext,
+            _arg0: u64,
+            _arg1: u64,
+            _arg2: u64,
+            _arg3: u64,
+            _arg4: u64,
+            _memory_mapping: &mut MemoryMapping,
+        ) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+            test_builtin_processor(invoke_context)
+        }
+    );
+
+    impl TestBuiltinEntrypoint {
+        const COMPUTE_UNITS: u64 = 800;
+        const NAME: &str = "test_builtin";
+        const PROGRAM_ID: Pubkey =
+            solana_sdk::pubkey!("TestProgram11111111111111111111111111111111");
+
+        fn cache_entry() -> ProgramCacheEntry {
+            ProgramCacheEntry::new_builtin(0, Self::NAME.len(), Self::vm)
+        }
+
+        fn instruction(
+            from: &Pubkey,
+            to: &Pubkey,
+            lamports: u64,
+            space: u64,
+            owner: &Pubkey,
+        ) -> Instruction {
+            let data = {
+                let mut data = vec![0; 16];
+                data[0..8].copy_from_slice(&lamports.to_le_bytes());
+                data[8..16].copy_from_slice(&space.to_le_bytes());
+                data
+            };
+            Instruction::new_with_bytes(
+                Self::PROGRAM_ID,
+                &data,
+                vec![
+                    AccountMeta::new(*from, true),
+                    AccountMeta::new(*to, true),
+                    AccountMeta::new_readonly(*owner, false),
+                    AccountMeta::new_readonly(system_program::id(), false),
+                ],
+            )
         }
     }
 
@@ -5102,11 +5205,13 @@ pub mod tests {
 
         fn update_prioritization_fee_cache(&self, transactions: Vec<Transaction>) {
             let bank = self.working_bank();
-            let prioritization_fee_cache = &self.meta.prioritization_fee_cache;
+
             let transactions: Vec<_> = transactions
                 .into_iter()
                 .map(RuntimeTransaction::from_transaction_for_tests)
                 .collect();
+
+            let prioritization_fee_cache = &self.meta.prioritization_fee_cache;
             prioritization_fee_cache.update(&bank, transactions.iter());
         }
 
@@ -6451,25 +6556,27 @@ pub mod tests {
             ref meta, ref io, ..
         } = rpc;
 
-        let recent_slot = 123;
-        let mut slot_hashes = SlotHashes::default();
-        slot_hashes.add(recent_slot, Hash::new_unique());
-        bank.set_sysvar_for_tests(&slot_hashes);
+        let from = rpc.mint_keypair;
+        let from_pubkey = from.pubkey();
+        let to = Keypair::new();
+        let to_pubkey = to.pubkey();
 
-        let lookup_table_authority = Keypair::new();
-        let lookup_table_space = solana_sdk::address_lookup_table::state::LOOKUP_TABLE_META_SIZE;
-        let lookup_table_lamports = bank.get_minimum_balance_for_rent_exemption(lookup_table_space);
+        let space = 0;
+        let lamports = bank.rent_collector().rent.minimum_balance(space);
+        let owner_pubkey = Pubkey::new_unique();
 
-        let (instruction, lookup_table_address) =
-            solana_sdk::address_lookup_table::instruction::create_lookup_table(
-                lookup_table_authority.pubkey(),
-                rpc.mint_keypair.pubkey(),
-                recent_slot,
-            );
+        let instruction = TestBuiltinEntrypoint::instruction(
+            &from_pubkey,
+            &to_pubkey,
+            lamports,
+            space as u64,
+            &owner_pubkey,
+        );
+
         let tx = Transaction::new_signed_with_payer(
             &[instruction],
-            Some(&rpc.mint_keypair.pubkey()),
-            &[&rpc.mint_keypair],
+            Some(&from_pubkey),
+            &[&from, &to],
             recent_blockhash,
         );
         let tx_serialized_encoded =
@@ -6500,18 +6607,17 @@ pub mod tests {
                     "err":null,
                     "innerInstructions": null,
                     "logs":[
-                        "Program AddressLookupTab1e1111111111111111111111111 invoke [1]",
+                        "Program TestProgram11111111111111111111111111111111 invoke [1]",
+                        "I am logging from a builtin program!",
+                        "I am about to CPI to System!",
                         "Program 11111111111111111111111111111111 invoke [2]",
                         "Program 11111111111111111111111111111111 success",
-                        "Program 11111111111111111111111111111111 invoke [2]",
-                        "Program 11111111111111111111111111111111 success",
-                        "Program 11111111111111111111111111111111 invoke [2]",
-                        "Program 11111111111111111111111111111111 success",
-                        "Program AddressLookupTab1e1111111111111111111111111 success"
+                        "All done!",
+                        "Program TestProgram11111111111111111111111111111111 success"
                     ],
                     "replacementBlockhash": null,
                     "returnData":null,
-                    "unitsConsumed":1200,
+                    "unitsConsumed":TestBuiltinEntrypoint::COMPUTE_UNITS + 150,
                 }
             },
             "id": 1,
@@ -6544,18 +6650,17 @@ pub mod tests {
                     "err":null,
                     "innerInstructions": null,
                     "logs":[
-                        "Program AddressLookupTab1e1111111111111111111111111 invoke [1]",
+                        "Program TestProgram11111111111111111111111111111111 invoke [1]",
+                        "I am logging from a builtin program!",
+                        "I am about to CPI to System!",
                         "Program 11111111111111111111111111111111 invoke [2]",
                         "Program 11111111111111111111111111111111 success",
-                        "Program 11111111111111111111111111111111 invoke [2]",
-                        "Program 11111111111111111111111111111111 success",
-                        "Program 11111111111111111111111111111111 invoke [2]",
-                        "Program 11111111111111111111111111111111 success",
-                        "Program AddressLookupTab1e1111111111111111111111111 success"
+                        "All done!",
+                        "Program TestProgram11111111111111111111111111111111 success"
                     ],
                     "replacementBlockhash": null,
                     "returnData":null,
-                    "unitsConsumed":1200,
+                    "unitsConsumed":TestBuiltinEntrypoint::COMPUTE_UNITS + 150,
                 }
             },
             "id": 1,
@@ -6593,35 +6698,13 @@ pub mod tests {
                             {
                             "parsed": {
                                 "info": {
-                                "destination": lookup_table_address.to_string(),
-                                "lamports": lookup_table_lamports,
-                                "source": rpc.mint_keypair.pubkey().to_string()
+                                    "lamports": lamports,
+                                    "newAccount": to_pubkey.to_string(),
+                                    "owner": owner_pubkey.to_string(),
+                                    "source": from_pubkey.to_string(),
+                                    "space": space,
                                 },
-                                "type": "transfer"
-                            },
-                            "program": "system",
-                            "programId": "11111111111111111111111111111111",
-                            "stackHeight": 2
-                            },
-                            {
-                            "parsed": {
-                                "info": {
-                                "account": lookup_table_address.to_string(),
-                                "space": lookup_table_space
-                                },
-                                "type": "allocate"
-                            },
-                            "program": "system",
-                            "programId": "11111111111111111111111111111111",
-                            "stackHeight": 2
-                            },
-                            {
-                            "parsed": {
-                                "info": {
-                                "account": lookup_table_address.to_string(),
-                                "owner": "AddressLookupTab1e1111111111111111111111111"
-                                },
-                                "type": "assign"
+                                "type": "createAccount"
                             },
                             "program": "system",
                             "programId": "11111111111111111111111111111111",
@@ -6631,18 +6714,17 @@ pub mod tests {
                         }
                     ],
                     "logs":[
-                        "Program AddressLookupTab1e1111111111111111111111111 invoke [1]",
+                        "Program TestProgram11111111111111111111111111111111 invoke [1]",
+                        "I am logging from a builtin program!",
+                        "I am about to CPI to System!",
                         "Program 11111111111111111111111111111111 invoke [2]",
                         "Program 11111111111111111111111111111111 success",
-                        "Program 11111111111111111111111111111111 invoke [2]",
-                        "Program 11111111111111111111111111111111 success",
-                        "Program 11111111111111111111111111111111 invoke [2]",
-                        "Program 11111111111111111111111111111111 success",
-                        "Program AddressLookupTab1e1111111111111111111111111 success"
+                        "All done!",
+                        "Program TestProgram11111111111111111111111111111111 success"
                     ],
                     "replacementBlockhash": null,
                     "returnData":null,
-                    "unitsConsumed":1200,
+                    "unitsConsumed":TestBuiltinEntrypoint::COMPUTE_UNITS + 150,
                 }
             },
             "id": 1,
@@ -7044,6 +7126,14 @@ pub mod tests {
         genesis_config.fee_rate_governor = FeeRateGovernor::new(TEST_SIGNATURE_FEE, 0);
 
         let bank = Bank::new_with_config_for_tests(&genesis_config, config);
+
+        // Add the test builtin.
+        bank.add_builtin(
+            TestBuiltinEntrypoint::PROGRAM_ID,
+            TestBuiltinEntrypoint::NAME,
+            TestBuiltinEntrypoint::cache_entry(),
+        );
+
         (
             BankForks::new_rw_arc(bank),
             mint_keypair,
@@ -7861,12 +7951,12 @@ pub mod tests {
             let rpc = RpcHandler::start();
             let bank = rpc.working_bank();
             let RpcHandler { io, meta, .. } = rpc;
-            let mint = SplTokenPubkey::new_from_array([2; 32]);
-            let owner = SplTokenPubkey::new_from_array([3; 32]);
-            let delegate = SplTokenPubkey::new_from_array([4; 32]);
+            let mint = Pubkey::new_from_array([2; 32]);
+            let owner = Pubkey::new_from_array([3; 32]);
+            let delegate = Pubkey::new_from_array([4; 32]);
             let token_account_pubkey = solana_pubkey::new_rand();
             let token_with_different_mint_pubkey = solana_pubkey::new_rand();
-            let new_mint = SplTokenPubkey::new_from_array([5; 32]);
+            let new_mint = Pubkey::new_from_array([5; 32]);
             if program_id == solana_inline_spl::token_2022::id() {
                 // Add the token account
                 let account_base = TokenAccount {
@@ -8362,9 +8452,9 @@ pub mod tests {
         let bank = rpc.working_bank();
         let RpcHandler { io, meta, .. } = rpc;
 
-        let mint = SplTokenPubkey::new_from_array([2; 32]);
-        let owner = SplTokenPubkey::new_from_array([3; 32]);
-        let delegate = SplTokenPubkey::new_from_array([4; 32]);
+        let mint = Pubkey::new_from_array([2; 32]);
+        let owner = Pubkey::new_from_array([3; 32]);
+        let delegate = Pubkey::new_from_array([4; 32]);
         let token_account_pubkey = solana_pubkey::new_rand();
         let amount = 420;
         let delegated_amount = 30;

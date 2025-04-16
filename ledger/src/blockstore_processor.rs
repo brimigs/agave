@@ -18,7 +18,7 @@ use {
         accounts_db::AccountsDbConfig, accounts_update_notifier_interface::AccountsUpdateNotifier,
         epoch_accounts_hash::EpochAccountsHash,
     },
-    solana_cost_model::cost_model::CostModel,
+    solana_cost_model::{cost_model::CostModel, transaction_cost::TransactionCost},
     solana_entry::entry::{
         self, create_ticks, Entry, EntrySlice, EntryType, EntryVerificationStatus, VerifyRecyclers,
     },
@@ -55,7 +55,7 @@ use {
     },
     solana_svm::{
         transaction_commit_result::{TransactionCommitResult, TransactionCommitResultExtensions},
-        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
+        transaction_processing_result::ProcessedTransaction,
         transaction_processor::ExecutionRecordingConfig,
     },
     solana_svm_transaction::{svm_message::SVMMessage, svm_transaction::SVMTransaction},
@@ -162,8 +162,6 @@ pub fn execute_batch<'a>(
     timings: &'a mut ExecuteTimings,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: &'a PrioritizationFeeCache,
-    // None is meaningfully used to detect this is called from the block producing unified
-    // scheduler. If so, suppress too verbose logging for the code path.
     extra_pre_commit_callback: Option<
         impl FnOnce(&Result<ProcessedTransaction>) -> Result<Option<usize>>,
     >,
@@ -172,22 +170,27 @@ pub fn execute_batch<'a>(
         batch,
         transaction_indexes,
     } = batch;
-    let record_token_balances = transaction_status_sender.is_some();
-    let mut transaction_indexes = Cow::from(transaction_indexes);
 
+    // extra_pre_commit_callback allows for reuse of this function between the
+    // unified scheduler block production path and block verification path(s)
+    //   Some(_) => unified scheduler block production path
+    //   None    => block verification path(s)
+    let block_verification = extra_pre_commit_callback.is_none();
+    let record_transaction_meta = transaction_status_sender.is_some();
+
+    let mut transaction_indexes = Cow::from(transaction_indexes);
     let mut mint_decimals: HashMap<Pubkey, u8> = HashMap::new();
 
-    let pre_token_balances = if record_token_balances {
+    let pre_token_balances = if record_transaction_meta {
         collect_token_balances(bank, batch, &mut mint_decimals)
     } else {
         vec![]
     };
 
-    let pre_commit_callback = |timings: &mut _, processing_results: &_| -> PreCommitResult {
+    let pre_commit_callback = |_timings: &mut _, processing_results: &_| -> PreCommitResult {
         match extra_pre_commit_callback {
             None => {
                 get_first_error(batch, processing_results)?;
-                check_block_cost_limits_if_enabled(batch, bank, timings, processing_results)?;
                 Ok(None)
             }
             Some(extra_pre_commit_callback) => {
@@ -231,6 +234,32 @@ pub fn execute_batch<'a>(
             pre_commit_callback,
         )?;
 
+    let mut check_block_costs_elapsed = Measure::start("check_block_costs");
+    let tx_costs = if block_verification {
+        // Block verification (including unified scheduler) case;
+        // collect and check transaction costs
+        let tx_costs = get_transaction_costs(bank, &commit_results, batch.sanitized_transactions());
+        check_block_cost_limits(bank, &tx_costs).map(|_| tx_costs)
+    } else if record_transaction_meta {
+        // Unified scheduler block production case;
+        // the scheduler will track costs elsewhere but costs are recalculated
+        // here so they can be recorded with other transaction metadata
+        Ok(get_transaction_costs(
+            bank,
+            &commit_results,
+            batch.sanitized_transactions(),
+        ))
+    } else {
+        // Unified scheduler block production wihout metadata recording
+        Ok(vec![])
+    };
+    check_block_costs_elapsed.stop();
+    timings.saturating_add_in_place(
+        ExecuteTimingType::CheckBlockLimitsUs,
+        check_block_costs_elapsed.as_us(),
+    );
+    let tx_costs = tx_costs?;
+
     bank_utils::find_and_send_votes(
         batch.sanitized_transactions(),
         &commit_results,
@@ -240,8 +269,8 @@ pub fn execute_batch<'a>(
     let committed_transactions = commit_results
         .iter()
         .zip(batch.sanitized_transactions())
-        .filter_map(|(commit_result, tx)| commit_result.was_committed().then_some(tx))
-        .collect_vec();
+        .filter_map(|(commit_result, tx)| commit_result.was_committed().then_some(tx));
+    prioritization_fee_cache.update(bank, committed_transactions);
 
     if let Some(transaction_status_sender) = transaction_status_sender {
         let transactions: Vec<SanitizedTransaction> = batch
@@ -249,7 +278,7 @@ pub fn execute_batch<'a>(
             .iter()
             .map(|tx| tx.as_sanitized_transaction().into_owned())
             .collect();
-        let post_token_balances = if record_token_balances {
+        let post_token_balances = if record_transaction_meta {
             collect_token_balances(bank, batch, &mut mint_decimals)
         } else {
             vec![]
@@ -258,79 +287,66 @@ pub fn execute_batch<'a>(
         let token_balances =
             TransactionTokenBalancesSet::new(pre_token_balances, post_token_balances);
 
+        // The length of costs vector needs to be consistent with all other
+        // vectors that are sent over (such as `transactions`). So, replace the
+        // None elements with Some(0)
+        let tx_costs = tx_costs
+            .into_iter()
+            .map(|tx_cost_option| tx_cost_option.map(|tx_cost| tx_cost.sum()).or(Some(0)))
+            .collect();
+
         transaction_status_sender.send_transaction_status_batch(
             bank.slot(),
             transactions,
             commit_results,
             balances,
             token_balances,
+            tx_costs,
             transaction_indexes.into_owned(),
         );
     }
 
-    prioritization_fee_cache.update(bank, committed_transactions.into_iter());
-
     Ok(())
 }
 
-// collect transactions actual execution costs, subject to block limits;
-// block will be marked as dead if exceeds cost limits, details will be
-// reported to metric `replay-stage-mark_dead_slot`
-fn check_block_cost_limits(
+// Get actual transaction execution costs from transaction commit results
+fn get_transaction_costs<'a, Tx: TransactionWithMeta>(
     bank: &Bank,
-    processing_results: &[TransactionProcessingResult],
-    sanitized_transactions: &[impl TransactionWithMeta],
-) -> Result<()> {
-    assert_eq!(sanitized_transactions.len(), processing_results.len());
+    commit_results: &[TransactionCommitResult],
+    sanitized_transactions: &'a [Tx],
+) -> Vec<Option<TransactionCost<'a, Tx>>> {
+    assert_eq!(sanitized_transactions.len(), commit_results.len());
 
-    let tx_costs_with_actual_execution_units: Vec<_> = processing_results
+    commit_results
         .iter()
         .zip(sanitized_transactions)
-        .filter_map(|(processing_result, tx)| {
-            if let Ok(processed_tx) = processing_result {
+        .map(|(commit_result, tx)| {
+            if let Ok(committed_tx) = commit_result {
                 Some(CostModel::calculate_cost_for_executed_transaction(
                     tx,
-                    processed_tx.executed_units(),
-                    processed_tx.loaded_accounts_data_size(),
+                    committed_tx.executed_units,
+                    committed_tx.loaded_account_stats.loaded_accounts_data_size,
                     &bank.feature_set,
                 ))
             } else {
                 None
             }
         })
-        .collect();
-
-    {
-        let mut cost_tracker = bank.write_cost_tracker().unwrap();
-        for tx_cost in &tx_costs_with_actual_execution_units {
-            cost_tracker
-                .try_add(tx_cost)
-                .map_err(TransactionError::from)?;
-        }
-    }
-    Ok(())
+        .collect()
 }
 
-fn check_block_cost_limits_if_enabled(
-    batch: &TransactionBatch<impl TransactionWithMeta>,
+fn check_block_cost_limits<Tx: TransactionWithMeta>(
     bank: &Bank,
-    timings: &mut ExecuteTimings,
-    processing_results: &[TransactionProcessingResult],
+    tx_costs: &[Option<TransactionCost<'_, Tx>>],
 ) -> Result<()> {
-    let (check_block_cost_limits_result, check_block_cost_limits_us) = measure_us!(if bank
-        .feature_set
-        .is_active(&agave_feature_set::apply_cost_tracker_during_replay::id())
-    {
-        check_block_cost_limits(bank, processing_results, batch.sanitized_transactions())
-    } else {
-        Ok(())
-    });
+    let mut cost_tracker = bank.write_cost_tracker().unwrap();
+    for tx_cost in tx_costs.iter().flatten() {
+        cost_tracker
+            .try_add(tx_cost)
+            .map_err(TransactionError::from)?;
+    }
 
-    timings.saturating_add_in_place(
-        ExecuteTimingType::CheckBlockLimitsUs,
-        check_block_cost_limits_us,
-    );
-    check_block_cost_limits_result
+    Ok(())
 }
 
 #[derive(Default)]
@@ -2210,6 +2226,7 @@ pub struct TransactionStatusBatch {
     pub commit_results: Vec<TransactionCommitResult>,
     pub balances: TransactionBalancesSet,
     pub token_balances: TransactionTokenBalancesSet,
+    pub costs: Vec<Option<u64>>,
     pub transaction_indexes: Vec<usize>,
 }
 
@@ -2226,6 +2243,7 @@ impl TransactionStatusSender {
         commit_results: Vec<TransactionCommitResult>,
         balances: TransactionBalancesSet,
         token_balances: TransactionTokenBalancesSet,
+        costs: Vec<Option<u64>>,
         transaction_indexes: Vec<usize>,
     ) {
         if let Err(e) = self
@@ -2236,6 +2254,7 @@ impl TransactionStatusSender {
                 commit_results,
                 balances,
                 token_balances,
+                costs,
                 transaction_indexes,
             }))
         {
@@ -2339,12 +2358,7 @@ pub mod tests {
             system_transaction,
             transaction::{Transaction, TransactionError},
         },
-        solana_svm::{
-            account_loader::LoadedTransaction,
-            transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
-            transaction_processing_result::ProcessedTransaction,
-            transaction_processor::ExecutionRecordingConfig,
-        },
+        solana_svm::transaction_processor::ExecutionRecordingConfig,
         solana_vote::{vote_account::VoteAccount, vote_transaction},
         solana_vote_program::{
             self,
@@ -5311,36 +5325,19 @@ pub mod tests {
             );
         // set block-limit to be able to just have one transaction
         let block_limit = tx_cost.sum();
-
         bank.write_cost_tracker()
             .unwrap()
             .set_limits(u64::MAX, block_limit, u64::MAX);
-        let txs = vec![tx.clone(), tx];
-        let processing_results = vec![
-            Ok(ProcessedTransaction::Executed(Box::new(
-                ExecutedTransaction {
-                    execution_details: TransactionExecutionDetails {
-                        status: Ok(()),
-                        log_messages: None,
-                        inner_instructions: None,
-                        return_data: None,
-                        executed_units: actual_execution_cu,
-                        accounts_data_len_delta: 0,
-                    },
-                    loaded_transaction: LoadedTransaction {
-                        loaded_accounts_data_size: actual_loaded_accounts_data_size,
-                        ..LoadedTransaction::default()
-                    },
-                    programs_modified_by_tx: HashMap::new(),
-                },
-            ))),
-            Err(TransactionError::AccountNotFound),
-        ];
 
-        assert!(check_block_cost_limits(&bank, &processing_results, &txs).is_ok());
+        let tx_costs = vec![None, Some(tx_cost), None];
+        // The transaction will fit when added the first time
+        assert!(check_block_cost_limits(&bank, &tx_costs).is_ok());
+        // But adding a second time will exceed the block limit
         assert_eq!(
             Err(TransactionError::WouldExceedMaxBlockCostLimit),
-            check_block_cost_limits(&bank, &processing_results, &txs)
+            check_block_cost_limits(&bank, &tx_costs)
         );
+        // Adding another None will noop (even though the block is already full)
+        assert!(check_block_cost_limits(&bank, &tx_costs[0..1]).is_ok());
     }
 }

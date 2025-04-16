@@ -11,7 +11,6 @@ edition = { workspace = true }
 
 [dependencies]
 agave-feature-set = { workspace = true }
-agave-precompiles = { workspace = true }
 bincode = { workspace = true }
 libsecp256k1 = { workspace = true }
 num-traits = { workspace = true }
@@ -64,6 +63,7 @@ solana-program = { workspace = true }
 solana-pubkey = { workspace = true, features = ["rand"] }
 solana-rent = { workspace = true }
 solana-slot-hashes = { workspace = true }
+solana-svm-callback = { workspace = true }
 solana-transaction-context = { workspace = true, features = ["dev-context-only-utils"] }
 static_assertions = { workspace = true }
 test-case = { workspace = true }

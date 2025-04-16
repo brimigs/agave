@@ -545,6 +545,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
             .get_current_instruction_context()
             .unwrap(),
         true, // copy_account_data
+        true, // for mask_out_rent_epoch_in_vm_serialization
     )
     .unwrap();
 

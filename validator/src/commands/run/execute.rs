@@ -107,6 +107,7 @@ pub fn execute(
         rocksdb_compaction_threads,
         rocksdb_flush_threads,
         tvu_receive_threads,
+        tvu_retransmit_threads,
         tvu_sigverify_threads,
     } = cli::thread_args::parse_num_threads_args(matches);
 
@@ -978,7 +979,6 @@ pub fn execute(
         snapshot_version,
         maximum_full_snapshot_archives_to_retain,
         maximum_incremental_snapshot_archives_to_retain,
-        accounts_hash_debug_verify: validator_config.accounts_db_test_hash_calculation,
         packager_thread_niceness_adj: snapshot_packager_niceness_adj,
     };
 
@@ -1164,7 +1164,8 @@ pub fn execute(
         bind_ip_addr: bind_address,
         public_tpu_addr,
         public_tpu_forwards_addr,
-        num_tvu_sockets: tvu_receive_threads,
+        num_tvu_receive_sockets: tvu_receive_threads,
+        num_tvu_retransmit_sockets: tvu_retransmit_threads,
         num_quic_endpoints,
     };
 

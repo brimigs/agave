@@ -105,12 +105,10 @@ mod tests {
         bank.store_account_and_update_capitalization(address, &account);
     }
 
-    #[test_case(solana_sdk::address_lookup_table::program::id(), None)]
     #[test_case(solana_sdk::bpf_loader::id(), None)]
     #[test_case(solana_sdk::bpf_loader_deprecated::id(), None)]
     #[test_case(solana_sdk::bpf_loader_upgradeable::id(), None)]
     #[test_case(solana_sdk::compute_budget::id(), None)]
-    #[test_case(solana_config_program::id(), None)]
     #[test_case(solana_stake_program::id(), None)]
     #[test_case(solana_system_program::id(), None)]
     #[test_case(solana_vote_program::id(), None)]

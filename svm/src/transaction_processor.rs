@@ -15,16 +15,12 @@ use {
         transaction_account_state_info::TransactionAccountStateInfo,
         transaction_error_metrics::TransactionErrorMetrics,
         transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
-        transaction_processing_callback::TransactionProcessingCallback,
         transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     },
     agave_feature_set::{remove_accounts_executable_flag_checks, FeatureSet},
     log::debug,
     percentage::Percentage,
     solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, PROGRAM_OWNERS},
-    solana_bpf_loader_program::syscalls::{
-        create_program_runtime_environment_v1, create_program_runtime_environment_v2,
-    },
     solana_clock::{Epoch, Slot},
     solana_hash::Hash,
     solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
@@ -39,7 +35,7 @@ use {
         versions::Versions as NonceVersions,
     },
     solana_program_runtime::{
-        execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
+        execution_budget::SVMTransactionExecutionCost,
         invoke_context::{EnvironmentConfig, InvokeContext},
         loaded_programs::{
             ForkGraph, ProgramCache, ProgramCacheEntry, ProgramCacheForTxBatch,
@@ -51,6 +47,7 @@ use {
     solana_pubkey::Pubkey,
     solana_rent_collector::RentCollector,
     solana_sdk_ids::{native_loader, system_program},
+    solana_svm_callback::TransactionProcessingCallback,
     solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
     solana_svm_transaction::{svm_message::SVMMessage, svm_transaction::SVMTransaction},
     solana_timings::{ExecuteTimingType, ExecuteTimings},
@@ -140,7 +137,7 @@ pub struct TransactionProcessingEnvironment<'a> {
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
 #[cfg_attr(
     feature = "dev-context-only-utils",
-    field_qualifiers(slot(pub), epoch(pub))
+    field_qualifiers(slot(pub), epoch(pub), sysvar_cache(pub))
 )]
 pub struct TransactionBatchProcessor<FG: ForkGraph> {
     /// Bank slot (i.e. block)
@@ -778,92 +775,6 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         loaded_programs_for_txs.unwrap()
     }
 
-    pub fn prepare_program_cache_for_upcoming_feature_set<CB: TransactionProcessingCallback>(
-        &self,
-        callbacks: &CB,
-        upcoming_feature_set: &FeatureSet,
-        compute_budget: &SVMTransactionExecutionBudget,
-        slot_index: u64,
-        slots_in_epoch: u64,
-    ) {
-        // Recompile loaded programs one at a time before the next epoch hits
-        let slots_in_recompilation_phase =
-            (solana_program_runtime::loaded_programs::MAX_LOADED_ENTRY_COUNT as u64)
-                .min(slots_in_epoch)
-                .checked_div(2)
-                .unwrap();
-        let mut program_cache = self.program_cache.write().unwrap();
-        if program_cache.upcoming_environments.is_some() {
-            if let Some((key, program_to_recompile)) = program_cache.programs_to_recompile.pop() {
-                let effective_epoch = program_cache.latest_root_epoch.saturating_add(1);
-                drop(program_cache);
-                let environments_for_epoch = self
-                    .program_cache
-                    .read()
-                    .unwrap()
-                    .get_environments_for_epoch(effective_epoch);
-                if let Some(recompiled) = load_program_with_pubkey(
-                    callbacks,
-                    &environments_for_epoch,
-                    &key,
-                    self.slot,
-                    &mut ExecuteTimings::default(),
-                    false,
-                ) {
-                    recompiled.tx_usage_counter.fetch_add(
-                        program_to_recompile
-                            .tx_usage_counter
-                            .load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
-                    recompiled.ix_usage_counter.fetch_add(
-                        program_to_recompile
-                            .ix_usage_counter
-                            .load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
-                    let mut program_cache = self.program_cache.write().unwrap();
-                    program_cache.assign_program(key, recompiled);
-                }
-            }
-        } else if self.epoch != program_cache.latest_root_epoch
-            || slot_index.saturating_add(slots_in_recompilation_phase) >= slots_in_epoch
-        {
-            // Anticipate the upcoming program runtime environment for the next epoch,
-            // so we can try to recompile loaded programs before the feature transition hits.
-            drop(program_cache);
-            let mut program_cache = self.program_cache.write().unwrap();
-            let program_runtime_environment_v1 = create_program_runtime_environment_v1(
-                upcoming_feature_set,
-                compute_budget,
-                false, /* deployment */
-                false, /* debugging_features */
-            )
-            .unwrap();
-            let program_runtime_environment_v2 = create_program_runtime_environment_v2(
-                compute_budget,
-                false, /* debugging_features */
-            );
-            let mut upcoming_environments = program_cache.environments.clone();
-            let changed_program_runtime_v1 =
-                *upcoming_environments.program_runtime_v1 != program_runtime_environment_v1;
-            let changed_program_runtime_v2 =
-                *upcoming_environments.program_runtime_v2 != program_runtime_environment_v2;
-            if changed_program_runtime_v1 {
-                upcoming_environments.program_runtime_v1 = Arc::new(program_runtime_environment_v1);
-            }
-            if changed_program_runtime_v2 {
-                upcoming_environments.program_runtime_v2 = Arc::new(program_runtime_environment_v2);
-            }
-            program_cache.upcoming_environments = Some(upcoming_environments);
-            program_cache.programs_to_recompile = program_cache
-                .get_flattened_entries(changed_program_runtime_v1, changed_program_runtime_v2);
-            program_cache
-                .programs_to_recompile
-                .sort_by_cached_key(|(_id, program)| program.decayed_usage_counter(self.slot));
-        }
-    }
-
     /// Execute a transaction using the provided loaded accounts and update
     /// the executors cache if the transaction was successful.
     #[allow(clippy::too_many_arguments)]
@@ -933,8 +844,6 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         let mut executed_units = 0u64;
         let sysvar_cache = &self.sysvar_cache.read().unwrap();
-        let epoch_vote_account_stake_callback =
-            |pubkey| callback.get_current_epoch_vote_account_stake(pubkey);
 
         let mut invoke_context = InvokeContext::new(
             &mut transaction_context,
@@ -942,8 +851,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             EnvironmentConfig::new(
                 environment.blockhash,
                 environment.blockhash_lamports_per_signature,
-                environment.epoch_total_stake,
-                &epoch_vote_account_stake_callback,
+                callback,
                 Arc::clone(&environment.feature_set),
                 sysvar_cache,
             ),
@@ -1159,7 +1067,6 @@ mod tests {
             account_loader::{LoadedTransactionAccount, ValidatedTransactionDetails},
             nonce_info::NonceInfo,
             rollback_accounts::RollbackAccounts,
-            transaction_processing_callback::AccountState,
         },
         agave_feature_set::FeatureSet,
         agave_reserved_account_keys::ReservedAccountKeys,
@@ -1174,7 +1081,9 @@ mod tests {
         solana_message::{LegacyMessage, Message, MessageHeader, SanitizedMessage},
         solana_nonce as nonce,
         solana_program_runtime::{
-            execution_budget::SVMTransactionExecutionAndFeeBudgetLimits,
+            execution_budget::{
+                SVMTransactionExecutionAndFeeBudgetLimits, SVMTransactionExecutionBudget,
+            },
             loaded_programs::{BlockRelation, ProgramCacheEntryType},
         },
         solana_rent::Rent,
@@ -1182,6 +1091,7 @@ mod tests {
         solana_rent_debits::RentDebits,
         solana_sdk_ids::{bpf_loader, system_program, sysvar},
         solana_signature::Signature,
+        solana_svm_callback::{AccountState, InvokeContextCallback},
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         solana_transaction_context::TransactionContext,
         solana_transaction_error::{TransactionError, TransactionError::DuplicateInstruction},
@@ -1210,6 +1120,8 @@ mod tests {
         inspected_accounts:
             Arc<RwLock<HashMap<Pubkey, Vec<(Option<AccountSharedData>, /* is_writable */ bool)>>>>,
     }
+
+    impl InvokeContextCallback for MockBankCallback {}
 
     impl TransactionProcessingCallback for MockBankCallback {
         fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {

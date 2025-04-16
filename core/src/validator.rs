@@ -1091,7 +1091,7 @@ impl Validator {
             let connection_cache = ConnectionCache::new_with_client_options(
                 "connection_cache_tpu_quic",
                 tpu_connection_pool_size,
-                None,
+                Some(node.sockets.quic_forwards_client),
                 Some((
                     &identity_keypair,
                     node.info
@@ -1115,7 +1115,7 @@ impl Validator {
             let vote_connection_cache = ConnectionCache::new_with_client_options(
                 "connection_cache_vote_quic",
                 tpu_connection_pool_size,
-                None, // client_endpoint
+                Some(node.sockets.quic_vote_client),
                 Some((
                     &identity_keypair,
                     node.info
@@ -1182,7 +1182,10 @@ impl Validator {
                 max_complete_rewards_slot,
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
                 client_option: if config.use_tpu_client_next {
-                    ClientOption::TpuClientNext(Arc::as_ref(&identity_keypair))
+                    ClientOption::TpuClientNext(
+                        Arc::as_ref(&identity_keypair),
+                        node.sockets.rpc_sts_client,
+                    )
                 } else {
                     ClientOption::ConnectionCache(connection_cache.clone())
                 },
@@ -1554,7 +1557,6 @@ impl Validator {
                 wen_restart_repair_slots: wen_restart_repair_slots.clone(),
                 wait_for_supermajority_threshold_percent:
                     WAIT_FOR_WEN_RESTART_SUPERMAJORITY_THRESHOLD_PERCENT,
-                snapshot_config: config.snapshot_config.clone(),
                 snapshot_controller: Some(snapshot_controller.clone()),
                 abs_status: accounts_background_service.status().clone(),
                 genesis_config_hash: genesis_config.hash(),
@@ -1577,6 +1579,7 @@ impl Validator {
                 transactions_quic: node.sockets.tpu_quic,
                 transactions_forwards_quic: node.sockets.tpu_forwards_quic,
                 vote_quic: node.sockets.tpu_vote_quic,
+                vote_forwards_client: node.sockets.tpu_vote_forwards_client,
             },
             &rpc_subscriptions,
             transaction_status_sender,
@@ -2524,8 +2527,8 @@ fn initialize_rpc_transaction_history_services(
 
 #[derive(Error, Debug)]
 pub enum ValidatorError {
-    #[error("Bad expected bank hash")]
-    BadExpectedBankHash,
+    #[error("bank hash mismatch: actual={0}, expected={1}")]
+    BankHashMismatch(Hash, Hash),
 
     #[error("blockstore error: {0}")]
     Blockstore(#[source] BlockstoreError),
@@ -2533,8 +2536,11 @@ pub enum ValidatorError {
     #[error("genesis hash mismatch: actual={0}, expected={1}")]
     GenesisHashMismatch(Hash, Hash),
 
-    #[error("Ledger does not have enough data to wait for supermajority")]
-    NotEnoughLedgerData,
+    #[error(
+        "ledger does not have enough data to wait for supermajority: \
+        current slot={0}, needed slot={1}"
+    )]
+    NotEnoughLedgerData(Slot, Slot),
 
     #[error("failed to open genesis: {0}")]
     OpenGenesisConfig(#[source] OpenGenesisConfigError),
@@ -2584,25 +2590,20 @@ fn wait_for_supermajority(
             match wait_for_supermajority_slot.cmp(&bank.slot()) {
                 std::cmp::Ordering::Less => return Ok(false),
                 std::cmp::Ordering::Greater => {
-                    error!(
-                        "Ledger does not have enough data to wait for supermajority, please \
-                         enable snapshot fetch. Has {} needs {}",
+                    return Err(ValidatorError::NotEnoughLedgerData(
                         bank.slot(),
-                        wait_for_supermajority_slot
-                    );
-                    return Err(ValidatorError::NotEnoughLedgerData);
+                        wait_for_supermajority_slot,
+                    ));
                 }
                 _ => {}
             }
 
             if let Some(expected_bank_hash) = config.expected_bank_hash {
                 if bank.hash() != expected_bank_hash {
-                    error!(
-                        "Bank hash({}) does not match expected value: {}",
+                    return Err(ValidatorError::BankHashMismatch(
                         bank.hash(),
-                        expected_bank_hash
-                    );
-                    return Err(ValidatorError::BadExpectedBankHash);
+                        expected_bank_hash,
+                    ));
                 }
             }
 
@@ -3098,7 +3099,7 @@ mod tests {
 
         // bank=0, wait=1, should fail
         config.wait_for_supermajority = Some(1);
-        matches!(
+        assert!(matches!(
             wait_for_supermajority(
                 &config,
                 None,
@@ -3107,8 +3108,8 @@ mod tests {
                 rpc_override_health_check.clone(),
                 &start_progress,
             ),
-            Err(ValidatorError::NotEnoughLedgerData),
-        );
+            Err(ValidatorError::NotEnoughLedgerData(_, _)),
+        ));
 
         // bank=1, wait=0, should pass, bank is past the wait slot
         let bank_forks = BankForks::new_rw_arc(Bank::new_from_parent(
@@ -3130,7 +3131,7 @@ mod tests {
         // bank=1, wait=1, equal, but bad hash provided
         config.wait_for_supermajority = Some(1);
         config.expected_bank_hash = Some(hash(&[1]));
-        matches!(
+        assert!(matches!(
             wait_for_supermajority(
                 &config,
                 None,
@@ -3139,8 +3140,8 @@ mod tests {
                 rpc_override_health_check,
                 &start_progress,
             ),
-            Err(ValidatorError::BadExpectedBankHash),
-        );
+            Err(ValidatorError::BankHashMismatch(_, _)),
+        ));
     }
 
     #[test]

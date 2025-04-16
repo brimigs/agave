@@ -33,7 +33,6 @@ lru = { workspace = true }
 mockall = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
-proptest = { workspace = true }
 prost = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true }
@@ -68,6 +67,7 @@ solana-sdk = { workspace = true }
 solana-stake-program = { workspace = true }
 solana-storage-bigtable = { workspace = true }
 solana-storage-proto = { workspace = true }
+solana-streamer = { workspace = true }
 solana-svm = { workspace = true }
 solana-svm-transaction = { workspace = true }
 solana-timings = { workspace = true }
@@ -90,18 +90,21 @@ trees = { workspace = true }
 [dependencies.rocksdb]
 # Avoid the vendored bzip2 within rocksdb-sys that can cause linker conflicts
 # when also using the bzip2 crate
-version = "0.23.0"
+version = "0.22.0"
 default-features = false
 features = ["lz4"]
 
 [dev-dependencies]
 bs58 = { workspace = true }
 criterion = { workspace = true }
+proptest = { workspace = true }
 solana-account-decoder = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`
 solana-ledger = { path = ".", features = ["dev-context-only-utils"] }
 solana-logger = { workspace = true }
 solana-net-utils = { workspace = true, features = ["dev-context-only-utils"] }
+solana-program-option = { workspace = true }
+solana-program-pack = { workspace = true }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-vote = { workspace = true, features = ["dev-context-only-utils"] }
 spl-pod = { workspace = true }
@@ -118,9 +121,6 @@ frozen-abi = [
 [lib]
 crate-type = ["lib"]
 name = "solana_ledger"
-
-[[bench]]
-name = "sigverify_shreds"
 
 [[bench]]
 name = "blockstore"
